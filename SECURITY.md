@@ -40,17 +40,78 @@ Bridge binds to). It never connects to a remote IMAP host, and TLS certificate v
 disabled (`rejectUnauthorized` stays at its secure default; trust comes from Bridge's own exported
 certificate, supplied via `tls.ca`).
 
-## No SMTP in V1
+## No SMTP, ever
 
-There is no SMTP client, no send capability, and no reply capability anywhere in this codebase.
+There is no SMTP client, no send capability, and no reply/forward capability anywhere in this
+codebase — in V1 or V2, and there is no plan to add one.
 
-## No destructive IMAP commands in V1
+## No destructive IMAP commands, ever
 
-Every mailbox is opened with `readOnly: true`. There is no code path that issues STORE (flag
-changes), MOVE, COPY-then-EXPUNGE, DELETE, CREATE, RENAME, or APPEND. Listing or reading a message
-never sets `\Seen`. If a future version adds any mutating capability, it must be opt-in, clearly
-separated from V1's read-only tools, and documented here and in README.md's "V1 read-only
-limitations" before it ships.
+There is no code path that issues DELETE, EXPUNGE, or permanent removal of a message, in V1 or
+V2. V1 opens every mailbox with `readOnly: true`; listing or reading a message never sets `\Seen`.
+
+V2 (see README.md "Mutation model") adds STORE (flag changes), MOVE, and CREATE — but only through
+message tools that take explicit UIDs (max 25, enforced twice), plus folder creation with an explicit name
+and optional parent. All default to `dryRun: true` and never accept
+a search query or a broad selector as a mutation target. `mail_mark_spam` additionally requires both
+`confirm: true` and `acknowledgeFutureFiltering: true` when `dryRun: false`; a missing confirmation is
+rejected before a write-mode lock. A dry-run call structurally cannot mutate anything: it never
+opens a mailbox in write mode at all (proven directly by the test suite, which spies on every
+mutating ImapFlow method and on every lock's `readOnly` flag). If a future version adds any further
+mutating capability, it must follow the same model, and be documented here and in README.md's "V2
+mutation limitations" before it ships.
+
+## Stale UIDs are never reused blindly
+
+IMAP UIDs are unique only within one mailbox. Confirmed live across `mail_archive`, `mail_move`, and
+`mail_remove_label`: relocating a message routinely assigns it a new UID in the destination — including,
+for `mail_remove_label`, a new UID in the _same_ folder the message was already in (observed: INBOX UID
+705 became UID 706 after its label was removed). Every affected mutation result reports this via
+`transitions` (`resultingUid`, or `requiresRefresh: true` when it genuinely cannot be determined), and
+resolving it never guesses: the server's own UIDPLUS mapping first, exact-match `Message-ID` correlation
+second, nothing else — never subject, sender, or mailbox position. This project's own code never reuses a
+pre-mutation UID for a follow-up mutation without going through that reconciliation; anything built on top
+of these tools must not either. See README.md ("IMAP UID semantics").
+
+## Custom folders are namespace-confined by construction
+
+Proton Mail Bridge only exposes custom folders under `Folders/...` and labels under `Labels/...` —
+confirmed live, not just from documentation: `CREATE "MCP Test"` at the true IMAP root was correctly
+rejected by Bridge ("invalid mailbox name [...]: operation not allowed"). This is expected Proton
+Bridge behavior, not a bug. `src/mutations/policy.ts` is the only place that builds a custom-folder
+path, and it always prepends the `Folders` namespace from logical segments — there is no code path
+in `mail_create_folder` or `mail_move` that accepts a caller-supplied full path and uses it verbatim,
+so neither tool can create or target a mailbox at IMAP root, under `Labels`, or via a path-traversal
+style empty segment. See README.md ("Proton Bridge namespace: `Folders/` and `Labels/`").
+
+Proton also enforces one shared name per account across folders and labels, even though they are
+physically distinct Bridge mailboxes — confirmed live: an existing label made Bridge reject
+`CREATE "Folders/MCP Test"` with `409 Label or folder with this name already exists`.
+`mail_create_folder` checks this locally, via `findNameConflict()` in `src/mutations/policy.ts`,
+before ever issuing IMAP CREATE — a known collision is reported as a structured local result
+(`conflictType`, `conflictingPath`), never sent to Bridge to fail there. See README.md
+("Cross-namespace name collisions: folders and labels share one name per account").
+
+## Spam filtering is a persistent Proton effect
+
+Archive and Move organize messages. `mail_mark_spam` issues a Bridge IMAP MOVE of explicit UIDs to Spam.
+In a live test, **INBOX UID 708 → Spam UID 3**; subsequent manual inspection of Proton Mail showed the
+sender in the account-level Spam List. Proton may therefore route future messages from that sender to
+Spam. The project does not call a Spam List API or manage that list directly. Both dry-run and live
+results carry `spamFilteringNotice` with `futureFilteringEffect: true`; the warning contains no sender
+address.
+
+Proton Block is a different, stronger feature. This project does not implement Block List or Allow List
+management. Automatic unsubscribe is also absent; a future version may address legitimate newsletters
+the user no longer wants. See README.md ("Spam vs. Archive/Move vs. Block").
+
+## Untrusted content cannot drive a mutation
+
+No V2 mutation tool reads a message's subject, body, or sender name to decide what to change.
+`mail_apply_label` / `mail_remove_label` read exactly one content-derived field — the `Message-ID`
+header — and only to correlate the same message across two mailboxes, never to decide what action
+to take. The action is always the explicit UIDs and parameters the caller passed in; see
+`tests/prompt-injection-mutations.test.ts`.
 
 ## Reporting
 

@@ -1,19 +1,36 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { registerApplyLabelTool } from './tools/apply-label.js';
+import { registerArchiveTool } from './tools/archive.js';
+import { registerCreateFolderTool } from './tools/create-folder.js';
 import { registerGetMessageTool } from './tools/get-message.js';
 import { registerListFoldersTool } from './tools/list-folders.js';
 import { registerListMessagesTool } from './tools/list-messages.js';
+import { registerMarkReadTool } from './tools/mark-read.js';
+import { registerMarkSpamTool } from './tools/mark-spam.js';
+import { registerMarkUnreadTool } from './tools/mark-unread.js';
+import { registerMoveTool } from './tools/move.js';
+import { registerRemoveLabelTool } from './tools/remove-label.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 
 /**
- * Builds the MCP server and registers every V1 tool. V1 is strictly
- * read-only: only these four tools exist, and none of them can mutate a
- * mailbox (no mark-as-read, move, delete, send, or SMTP). Do not add a
- * mutating tool here without updating README.md's "V1 read-only
- * limitations" and SECURITY.md.
+ * Builds the MCP server and registers every tool.
+ *
+ * V1 (read-only, readOnlyHint: true): mail_list_folders, mail_list_messages,
+ * mail_search, mail_get_message. None of these can mutate a mailbox.
+ *
+ * V2 (mutation, readOnlyHint: false): mail_mark_read,
+ * mail_mark_unread, mail_archive, mail_move, mail_mark_spam,
+ * mail_apply_label, mail_remove_label, mail_create_folder. Every one of
+ * these operates only on explicit, caller-supplied UIDs (max 25 per call —
+ * see mutations/batch.ts), defaults to dryRun: true, and never deletes,
+ * expunges, sends, or touches SMTP. mail_mark_spam alone has destructiveHint:
+ * true because Proton may persistently filter future messages from its sender.
+ * Do not add a tool here without updating README.md's "V2 mutation limitations"
+ * and SECURITY.md.
  */
 export function createServer(): McpServer {
   const server = new McpServer(
@@ -26,10 +43,19 @@ export function createServer(): McpServer {
   registerSearchMailTool(server);
   registerGetMessageTool(server);
 
+  registerMarkReadTool(server);
+  registerMarkUnreadTool(server);
+  registerArchiveTool(server);
+  registerMoveTool(server);
+  registerMarkSpamTool(server);
+  registerApplyLabelTool(server);
+  registerRemoveLabelTool(server);
+  registerCreateFolderTool(server);
+
   return server;
 }
 
-/** Starts the server over stdio, the only transport V1 supports. */
+/** Starts the server over stdio, the only transport this project supports. */
 export async function startServer(): Promise<void> {
   const server = createServer();
   const transport = new StdioServerTransport();

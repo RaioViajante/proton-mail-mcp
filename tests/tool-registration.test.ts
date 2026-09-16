@@ -1,8 +1,16 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { describe, expect, it, vi } from 'vitest';
+import { registerApplyLabelTool } from '../src/tools/apply-label.js';
+import { registerArchiveTool } from '../src/tools/archive.js';
+import { registerCreateFolderTool } from '../src/tools/create-folder.js';
 import { registerGetMessageTool } from '../src/tools/get-message.js';
 import { registerListFoldersTool } from '../src/tools/list-folders.js';
 import { registerListMessagesTool } from '../src/tools/list-messages.js';
+import { registerMarkReadTool } from '../src/tools/mark-read.js';
+import { registerMarkSpamTool } from '../src/tools/mark-spam.js';
+import { registerMarkUnreadTool } from '../src/tools/mark-unread.js';
+import { registerMoveTool } from '../src/tools/move.js';
+import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
 
 interface CapturedRegistration {
@@ -21,42 +29,130 @@ function captureRegistrations(register: (server: McpServer) => void): CapturedRe
   return calls;
 }
 
-// This is the full V1 tool surface. If you are adding a fifth tool, also
-// update README.md's "V1 read-only limitations" section and confirm it is
-// not a mutating operation (see the test below).
-const registrars = [
+// V1: strictly read-only, no tool here may mutate anything.
+const readOnlyRegistrars = [
   registerListFoldersTool,
   registerListMessagesTool,
   registerSearchMailTool,
   registerGetMessageTool,
 ];
 
-describe('V1 tool registration', () => {
-  it('registers exactly one tool per registrar, matching the documented V1 tool names', () => {
-    const names = registrars.flatMap((register) =>
+// V2: mutation tools; every UID-based tool operates on explicit UIDs.
+// Spam alone is annotated destructive because Proton may persistently filter its sender.
+const mutationRegistrars = [
+  registerMarkReadTool,
+  registerMarkUnreadTool,
+  registerArchiveTool,
+  registerMoveTool,
+  registerMarkSpamTool,
+  registerApplyLabelTool,
+  registerRemoveLabelTool,
+  registerCreateFolderTool,
+];
+
+const EXPECTED_READ_ONLY_NAMES = [
+  'mail_get_message',
+  'mail_list_folders',
+  'mail_list_messages',
+  'mail_search',
+];
+
+const EXPECTED_MUTATION_NAMES = [
+  'mail_apply_label',
+  'mail_archive',
+  'mail_create_folder',
+  'mail_mark_read',
+  'mail_mark_spam',
+  'mail_mark_unread',
+  'mail_move',
+  'mail_remove_label',
+];
+
+// Verbs that must NEVER appear in ANY tool name in this project, V1 or V2 —
+// see README.md "V2 NÃO pode conter" / SECURITY.md.
+const BANNED_NAME_PATTERN =
+  /(delete|trash|expunge|smtp|send|reply|forward|permanent|unsubscribe|block[_-]?list|allow[_-]?list|draft.?send)/i;
+
+describe('V1 read-only tool registration', () => {
+  it('registers exactly the four documented read-only tool names', () => {
+    const names = readOnlyRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names.sort()).toEqual([
-      'mail_get_message',
-      'mail_list_folders',
-      'mail_list_messages',
-      'mail_search',
-    ]);
+    expect(names.sort()).toEqual(EXPECTED_READ_ONLY_NAMES);
   });
 
-  it('marks every registered tool as read-only and non-destructive', () => {
-    for (const register of registrars) {
+  it('marks every V1 tool as read-only and non-destructive', () => {
+    for (const register of readOnlyRegistrars) {
       const [registration] = captureRegistrations(register);
       expect(registration?.config.annotations?.readOnlyHint).toBe(true);
       expect(registration?.config.annotations?.destructiveHint).toBe(false);
     }
   });
+});
 
-  it('registers no tool whose name suggests a mutating operation', () => {
-    const mutatingNamePattern = /(mark|delete|move|archive|create|rename|send|reply|smtp)/i;
-    for (const register of registrars) {
+describe('V2 mutation tool registration', () => {
+  it('registers exactly the eight documented mutation tool names', () => {
+    const names = mutationRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    expect(names.sort()).toEqual(EXPECTED_MUTATION_NAMES);
+  });
+
+  it('marks every V2 tool as NOT read-only', () => {
+    for (const register of mutationRegistrars) {
       const [registration] = captureRegistrations(register);
-      expect(registration?.name).not.toMatch(mutatingNamePattern);
+      expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+    }
+  });
+
+  it('marks every V2 tool non-destructive, except mail_mark_spam', () => {
+    for (const register of mutationRegistrars) {
+      const [registration] = captureRegistrations(register);
+      const expected = registration?.name === 'mail_mark_spam';
+      expect(registration?.config.annotations?.destructiveHint).toBe(expected);
+    }
+  });
+
+  it('mail_mark_spam is explicitly annotated destructiveHint: true', () => {
+    const [registration] = captureRegistrations(registerMarkSpamTool);
+    expect(registration?.config.annotations?.destructiveHint).toBe(true);
+    expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+  });
+});
+
+describe('the full tool surface', () => {
+  const allRegistrars = [...readOnlyRegistrars, ...mutationRegistrars];
+
+  it('is exactly 12 tools, matching V1 (4) + V2 (8)', () => {
+    const names = allRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    expect(names).toHaveLength(12);
+    expect(new Set(names).size).toBe(12); // no accidental duplicate names
+  });
+
+  it('contains no tool whose name suggests a banned/destructive operation', () => {
+    for (const register of allRegistrars) {
+      const [registration] = captureRegistrations(register);
+      expect(registration?.name).not.toMatch(BANNED_NAME_PATTERN);
+    }
+  });
+
+  it('has no SMTP, send, reply, or forward tool registered anywhere', () => {
+    const names = allRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    for (const forbidden of ['smtp', 'send', 'reply', 'forward']) {
+      expect(names.some((name) => name.toLowerCase().includes(forbidden))).toBe(false);
+    }
+  });
+
+  it('has no delete, trash, or expunge tool registered anywhere', () => {
+    const names = allRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    for (const forbidden of ['delete', 'trash', 'expunge']) {
+      expect(names.some((name) => name.toLowerCase().includes(forbidden))).toBe(false);
     }
   });
 });

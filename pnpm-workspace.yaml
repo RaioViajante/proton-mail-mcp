@@ -1,0 +1,8 @@
+minimumReleaseAgeExclude:
+  - '@types/node@24.13.5'
+  - '@vitest/mocker@5.0.1'
+  - '@vitest/spy@5.0.1'
+  - '@zone-eu/mailsplit@5.4.17'
+  - imapflow@2.0.5
+  - libmime@5.4.4
+  - vitest@5.0.1

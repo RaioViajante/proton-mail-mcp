@@ -1,0 +1,19 @@
+# Dependencies and build output
+node_modules
+dist
+coverage
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Local secrets and certificates must never live inside the repo.
+# Real configuration lives outside this directory, in ~/.config/proton-mail-mcp/
+.env
+.env.*
+!.env.example
+*.pem
+*.crt
+*.key
+*.p12
+*.pfx

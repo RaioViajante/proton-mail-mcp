@@ -391,15 +391,20 @@ determine about post-mutation identity, per changed UID:
 - `transitions` is entirely absent (not an empty array) for `dryRun: true` calls and for operations with
   no `changedUids` — there is nothing to describe yet.
 
+### UIDPLUS mappings are verified
+
 ### Reconciliation strategy (`src/mutations/transitions.ts`)
 
 Determining `resultingUid` never guesses. In order:
 
-1. **The server's own UIDPLUS mapping** — the `uidMap` ImapFlow's `messageMove` returns when the IMAP
-   server supports the UIDPLUS extension, keyed by the UID on the source side of that specific move call.
-   Authoritative; no extra round trip.
-2. **`Message-ID` correlation** (`SEARCH HEADER Message-ID`) in the destination mailbox — used only when
-   step 1 has no answer, and only trusted when it resolves to **exactly one** match. Zero matches (not
+1. **The server's own UIDPLUS mapping, verified** — the `uidMap` ImapFlow's `messageMove` returns when the
+   IMAP server supports UIDPLUS, keyed by the UID on the source side of that specific move call. It is
+   treated only as a candidate: the candidate destination UID is fetched read-only and its Message-ID
+   must exactly match the source identity. A 25-message INBOX → Social live batch moved successfully, but
+   raw per-message destination associations were inconsistent, so this verification is mandatory.
+2. **`Message-ID` correlation** (`SEARCH HEADER Message-ID`) in the destination mailbox — used when the
+   mapping is absent or fails identity verification, and only trusted when it resolves to **exactly one**
+   match. Zero matches (not
    indexed yet) and more than one (ambiguous) are both treated as "cannot determine" — never picked
    between.
 

@@ -60,9 +60,11 @@ export function buildTransition(
  * ever guessing. Resolution order:
  *
  * 1. **The server's own UIDPLUS mapping** — `uidMap`, from ImapFlow's
- *    `messageMove`/`messageCopy` response, keyed by the UID the message
- *    had in whichever mailbox was the source of that specific move call.
- *    Authoritative; no further IMAP round trip needed.
+ *    `messageMove`/`messageCopy` response. It is only a candidate: the
+ *    candidate destination UID is fetched and its Message-ID is compared
+ *    with the source identity. Proton Bridge has produced inconsistent
+ *    multi-message associations in live testing, so this verification is
+ *    mandatory.
  * 2. **Message-ID correlation** (`SEARCH HEADER Message-ID`) in
  *    `destinationFolder` — used only when step 1 has no answer, and only
  *    trusted when it resolves to exactly one match. Subject, sender, and
@@ -80,17 +82,20 @@ export async function reconcileResultingUid(
   uidMap: Map<number, number> | undefined,
   messageId: string | undefined,
 ): Promise<number | undefined> {
-  const mapped = uidMap?.get(sourceSideUid);
-  if (mapped !== undefined) {
-    return mapped;
-  }
-
   if (!messageId) {
     return undefined;
   }
 
   const lock = await client.getMailboxLock(destinationFolder, { readOnly: true });
   try {
+    const mapped = uidMap?.get(sourceSideUid);
+    if (mapped !== undefined) {
+      const candidate = await client.fetchOne(mapped, { uid: true, envelope: true }, { uid: true });
+      if (candidate && candidate.envelope?.messageId === messageId) {
+        return mapped;
+      }
+    }
+
     const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
     if (uids && uids.length === 1) {
       return uids[0];

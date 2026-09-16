@@ -131,7 +131,9 @@ export function createFakeImapClient(options: FakeImapClientOptions = {}): FakeI
         yield message;
       }
     }),
-    fetchOne: vi.fn(() => fetchResultsFor(currentPath)[0] ?? false),
+    fetchOne: vi.fn(
+      (uid: number) => fetchResultsFor(currentPath).find((message) => message.uid === uid) ?? false,
+    ),
     list: vi.fn(() => options.folders ?? []),
     messageFlagsAdd: vi.fn(() => options.flagsOk ?? true),
     messageFlagsRemove: vi.fn(() => options.flagsOk ?? true),

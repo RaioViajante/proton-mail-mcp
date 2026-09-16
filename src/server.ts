@@ -16,7 +16,7 @@ import { registerSearchMailTool } from './tools/search-mail.js';
 import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.2.6';
+const SERVER_VERSION = '0.2.7';
 
 /**
  * Builds the MCP server and registers every tool.

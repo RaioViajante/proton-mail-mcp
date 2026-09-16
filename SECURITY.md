@@ -68,8 +68,10 @@ IMAP UIDs are unique only within one mailbox. Confirmed live across `mail_archiv
 for `mail_remove_label`, a new UID in the _same_ folder the message was already in (observed: INBOX UID
 705 became UID 706 after its label was removed). Every affected mutation result reports this via
 `transitions` (`resultingUid`, or `requiresRefresh: true` when it genuinely cannot be determined), and
-resolving it never guesses: the server's own UIDPLUS mapping first, exact-match `Message-ID` correlation
-second, nothing else — never subject, sender, or mailbox position. This project's own code never reuses a
+resolving it never guesses: a UIDPLUS mapping is first verified against the destination Message-ID, then
+exact-match `Message-ID` correlation is used as fallback, nothing else — never subject, sender, or mailbox
+position. A live 25-message INBOX-to-Social batch showed inconsistent raw per-message UID associations;
+the MCP therefore treats every mapping as untrusted until verified. This project's own code never reuses a
 pre-mutation UID for a follow-up mutation without going through that reconciliation; anything built on top
 of these tools must not either. See README.md ("IMAP UID semantics").
 

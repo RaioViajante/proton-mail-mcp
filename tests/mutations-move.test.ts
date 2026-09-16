@@ -235,7 +235,12 @@ describe('mail_mark_spam (markAsSpam)', () => {
   it('executes only with both confirmations and reports the Spam UID transition', async () => {
     const fake = createFakeImapClient({
       folders,
-      fetchResults: [fakeMessage(708)],
+      mailboxes: {
+        INBOX: {
+          fetchResults: [{ seq: 708, uid: 708, envelope: { messageId: '<spam@example.com>' } }],
+        },
+        Spam: { fetchResults: [{ seq: 3, uid: 3, envelope: { messageId: '<spam@example.com>' } }] },
+      },
       moveResult: { path: 'INBOX', destination: 'Spam', uidMap: new Map([[708, 3]]) },
     });
     const result = await markAsSpam(asImapFlow(fake), {

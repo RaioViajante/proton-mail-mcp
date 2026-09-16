@@ -229,11 +229,9 @@ export interface NameConflict {
  * CREATE. Narrow this only after a live test specifically exercises nested
  * naming.
  *
- * Reusable for both directions by construction: `mail_create_folder` uses
- * it today, and it already answers exactly what a future `mail_create_label`
- * would need too ("name taken by a folder" / "name taken by a label" /
- * "name available") — no separate label-side implementation is needed when
- * that tool is eventually added.
+ * Shared by `mail_create_folder` and `mail_create_label`: it answers
+ * "name taken by a folder" / "name taken by a label" / "name available"
+ * from either direction.
  */
 export function findNameConflict(
   folders: readonly ListResponse[],

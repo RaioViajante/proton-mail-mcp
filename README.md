@@ -41,7 +41,7 @@ See [SECURITY.md](SECURITY.md) for the condensed version of these rules.
 ```
 src/
   index.ts              # process entry point; starts the server over stdio
-  server.ts              # builds the McpServer and registers all 17 tools
+  server.ts              # builds the McpServer and registers all 18 tools
   bridge/
     client.ts            # opens/closes a Bridge IMAP connection
     config.ts            # non-secret config file + macOS Keychain password lookup
@@ -58,11 +58,12 @@ src/
     archive.ts                   # archive (fixed destination + Archive->Archive guard)
     spam.ts                       # mark as spam (fixed destination + two confirmation gates)
     labels.ts                      # apply/remove label (see "Labels vs. folders")
-    folders.ts                      # create folder (name/parent validation)
+    folders.ts                      # create folder and shared name validation
+    create-label.ts                 # create flat label
   tools/
     list-folders.ts, list-messages.ts, search-mail.ts, get-message.ts   # V1
     mark-read.ts, mark-unread.ts, archive.ts, move.ts,                  # V2
-    mark-spam.ts, apply-label.ts, remove-label.ts, create-folder.ts
+    mark-spam.ts, apply-label.ts, remove-label.ts, create-folder.ts, create-label.ts
   security/
     untrusted-content.ts  # labels + bounds any text pulled from an email
 
@@ -246,8 +247,9 @@ when it happens.
 
 Every message mutation below takes an explicit `folder` (or `sourceFolder`/`destinationFolder`), an
 explicit `uids` array (1–25), and `dryRun` (default `true`), and returns a
-[`MutationResult`](#mutation-audit-result). `mail_create_folder` takes a name and optional parent instead
-of UIDs, and returns `CreateFolderResult`. See ["Mutation model"](#mutation-model) for the shared rules.
+[`MutationResult`](#mutation-audit-result). `mail_create_folder` and `mail_create_label` take logical names
+instead of UIDs and return purpose-fit creation results. See ["Mutation model"](#mutation-model) for the
+shared rules.
 
 All are `destructiveHint: false` **except `mail_mark_spam`, which is `destructiveHint: true`** — a
 client-facing hint only, not a security control (see the table row below). None of the other annotations
@@ -263,6 +265,7 @@ change what a tool can actually do; the real protections are unchanged.
 | `mail_apply_label`   | `label`                                                        | Applies an existing Proton label. See ["Labels vs. folders"](#labels-vs-folders-behavior-model-pending-live-verification).                                                                                                                                |
 | `mail_remove_label`  | `label`                                                        | Removes an existing Proton label. Same caveats as above.                                                                                                                                                                                                  |
 | `mail_create_folder` | `name`, `parent` (optional)                                    | Creates a custom folder, always resolved under `Folders/` (see ["Proton Bridge namespace"](#proton-bridge-namespace-folders-and-labels)). Refuses reserved names and protected parents. No rename/delete yet.                                             |
+| `mail_create_label`  | `name`                                                         | Creates a flat custom label under `Labels/`; does not apply it to any message. Rejects raw paths and names already used by a folder or label.                                                                                                             |
 
 ## Mutation model
 
@@ -302,7 +305,7 @@ the UIDs you named.
 
 ## Mutation audit result
 
-Every V2 UID-based tool (all except `mail_create_folder`, which has no UID batch) returns the same
+Every UID-based mutation tool (all except `mail_create_folder` and `mail_create_label`) returns the same
 structured shape:
 
 ```json
@@ -332,7 +335,7 @@ structured shape:
 No result ever includes a message subject or body — only UIDs, paths, and short protocol-level error
 strings. This project keeps no persistent log of any kind, let alone one containing email content.
 
-`mail_create_folder` returns a different, purpose-fit shape instead (`{ operation, dryRun, path,
+`mail_create_folder` and `mail_create_label` return a different, purpose-fit shape instead (`{ operation, dryRun, path,
 alreadyExists, created, conflictType?, conflictingPath? }`) — forcing it into the UID-batch shape above
 would be misleading.
 
@@ -445,12 +448,13 @@ containers.
 these tools) give a logical name — `"MCP Test"`, or a nested `parent: "Projects"` + `name: "GitHub"` — and
 `src/mutations/policy.ts` resolves it deterministically:
 
-| You give (`mail_create_folder` / `mail_move`) | Bridge mailbox path this project actually uses                                                   |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `name: "MCP Test"` (no parent)                | `Folders/MCP Test`                                                                               |
-| `parent: "Projects"`, `name: "GitHub"`        | `Folders/Projects/GitHub`                                                                        |
-| `mail_move` destination `"MCP Test"`          | `Folders/MCP Test`                                                                               |
-| `mail_move` destination `"Folders/MCP Test"`  | `Folders/MCP Test` (already-qualified — idempotent, e.g. a path copied from `mail_list_folders`) |
+| You give (`mail_create_folder` / `mail_move`)      | Bridge mailbox path this project actually uses                                                   |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `name: "MCP Test"` (no parent)                     | `Folders/MCP Test`                                                                               |
+| `parent: "Projects"`, `name: "GitHub"`             | `Folders/Projects/GitHub`                                                                        |
+| `mail_move` destination `"MCP Test"`               | `Folders/MCP Test`                                                                               |
+| `mail_move` destination `"Folders/MCP Test"`       | `Folders/MCP Test` (already-qualified — idempotent, e.g. a path copied from `mail_list_folders`) |
+| `mail_create_label` name `"Newsletters e ofertas"` | `Labels/Newsletters e ofertas`                                                                   |
 
 `resolveCustomFolderReference()` / `customFolderPathFromSegments()` (`src/mutations/policy.ts`) are the only
 places that prepend the `Folders` namespace, and they use the delimiter reported by IMAP rather than
@@ -472,7 +476,7 @@ label `Labels/MCP Test`, `CREATE "Folders/MCP Test"` was rejected by Proton's ba
 executedCommand: '8 CREATE "Folders/MCP Test"'
 ```
 
-`mail_create_folder` catches this **locally, before ever issuing IMAP CREATE**, via
+`mail_create_folder` and `mail_create_label` catch this **locally, before ever issuing IMAP CREATE**, via
 `findNameConflict()` (`src/mutations/policy.ts`), which scans every existing `Folders/...` and `Labels/...`
 mailbox for the same leaf name and reports which one collides — in both dry-run and live calls alike:
 
@@ -488,9 +492,9 @@ mailbox for the same leaf name and reports which one collides — in both dry-ru
 }
 ```
 
-`findNameConflict()` is written to answer the question from either direction (name taken by a folder / by a
-label / available), so it is already reusable for a future `mail_create_label` tool, even though V2 does not
-implement one.
+`findNameConflict()` answers the question from either direction (name taken by a folder / by a label /
+available). A label duplicate reports `conflictType: "label"`; a same-named folder reports
+`conflictType: "folder"`. Both tools default to dry-run and issue no CREATE for known collisions.
 
 **Scope note (documented limitation, not invented behavior):** the live confirmation above is for a
 top-level name. Whether Proton's uniqueness constraint is truly global across every nesting depth, or
@@ -499,6 +503,10 @@ narrower (e.g. scoped only to siblings under the same parent), has not been sepa
 local rejection (pick a different name) rather than a false "looks fine" that then fails live at CREATE.
 
 ### Labels vs. folders (live-confirmed behavior)
+
+`mail_create_label` creates only the flat `Labels/<name>` mailbox. It accepts a logical name, rejects raw
+paths and nesting, and does **not** apply that label to any message. Creating and applying are separate
+operations. A controlled live CREATE validated a temporary empty label; no message was changed.
 
 Proton labels are **not** ordinary folders, and this project does not treat them as one. Per Proton's own
 documentation ([proton.me/support/labels-in-bridge](https://proton.me/support/labels-in-bridge), fetched
@@ -520,7 +528,7 @@ Applying and removing a label were also validated live. The message remained in 
 the label was applied. Removing it caused a mailbox-local UID change: INBOX UID 705 became UID 706. Use
 the returned `transitions` when acting on that message again.
 
-`mail_create_folder`'s dry-run path preview has a related, smaller caveat: it builds the previewed full path
+`mail_create_folder` and `mail_create_label` dry-run path previews have a related, smaller caveat: they build the previewed full path
 using the delimiter from the first folder ImapFlow's `list()` happens to return, since the authoritative
 delimiter is only resolved internally when `mailboxCreate` actually runs. This should match in practice (IMAP
 servers use one consistent delimiter), but is a best-effort preview, not a guarantee.
@@ -641,7 +649,7 @@ claude mcp add --scope user proton-mail node /path/to/proton-mail-mcp/dist/index
   restrictive `--scope local` (private to you, scoped to the current project directory) works too.
 - No `-e` / environment variables and no header/token flags — there is nothing secret to pass.
 
-Verify it's registered, connects, and exposes all 17 tools:
+Verify it's registered, connects, and exposes all 18 tools:
 
 ```
 claude mcp list

@@ -1,6 +1,6 @@
 {
   "name": "proton-mail-mcp",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "description": "Local Proton Mail Bridge MCP server with read-only mail intelligence and explicit, dry-run-by-default triage mutations.",
   "type": "module",

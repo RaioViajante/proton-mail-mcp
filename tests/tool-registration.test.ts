@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { registerApplyLabelTool } from '../src/tools/apply-label.js';
 import { registerArchiveTool } from '../src/tools/archive.js';
 import { registerCreateFolderTool } from '../src/tools/create-folder.js';
+import { registerCreateLabelTool } from '../src/tools/create-label.js';
 import { registerGetMessageTool } from '../src/tools/get-message.js';
 import { registerListFoldersTool } from '../src/tools/list-folders.js';
 import { registerListMessagesTool } from '../src/tools/list-messages.js';
@@ -49,6 +50,7 @@ const mutationRegistrars = [
   registerApplyLabelTool,
   registerRemoveLabelTool,
   registerCreateFolderTool,
+  registerCreateLabelTool,
 ];
 const intelligenceNames = [
   'mail_automation_candidates',
@@ -69,6 +71,7 @@ const EXPECTED_MUTATION_NAMES = [
   'mail_apply_label',
   'mail_archive',
   'mail_create_folder',
+  'mail_create_label',
   'mail_mark_read',
   'mail_mark_spam',
   'mail_mark_unread',
@@ -99,7 +102,7 @@ describe('V1 read-only tool registration', () => {
 });
 
 describe('V2 mutation tool registration', () => {
-  it('registers exactly the eight documented mutation tool names', () => {
+  it('registers exactly the nine documented mutation tool names', () => {
     const names = mutationRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
@@ -135,12 +138,12 @@ describe('the full tool surface', () => {
     registerTriageIntelligenceTools,
   ];
 
-  it('is exactly 17 tools, matching V1 (4) + V2 (8) + V2.5 (5)', () => {
+  it('is exactly 18 tools, matching V1 (4) + V2/V2.6 (9) + V2.5 (5)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(17);
-    expect(new Set(names).size).toBe(17); // no accidental duplicate names
+    expect(names).toHaveLength(18);
+    expect(new Set(names).size).toBe(18); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {

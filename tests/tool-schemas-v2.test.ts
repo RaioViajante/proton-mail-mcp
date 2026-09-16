@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { inputSchema as applyLabelSchema } from '../src/tools/apply-label.js';
 import { inputSchema as archiveSchema } from '../src/tools/archive.js';
 import { inputSchema as createFolderSchema } from '../src/tools/create-folder.js';
+import { inputSchema as createLabelSchema } from '../src/tools/create-label.js';
 import { inputSchema as markReadSchema } from '../src/tools/mark-read.js';
 import { inputSchema as markSpamSchema } from '../src/tools/mark-spam.js';
 import { inputSchema as markUnreadSchema } from '../src/tools/mark-unread.js';
@@ -148,5 +149,18 @@ describe('mail_create_folder input schema', () => {
   it('accepts a parent', () => {
     const result = createFolderSchema.parse({ name: 'Receipts', parent: 'Projects' });
     expect(result.parent).toBe('Projects');
+  });
+});
+
+describe('mail_create_label input schema', () => {
+  it('requires a name and defaults dryRun to true', () => {
+    expect(createLabelSchema.safeParse({}).success).toBe(false);
+    expect(createLabelSchema.safeParse({ name: '' }).success).toBe(false);
+    expect(createLabelSchema.parse({ name: 'News' })).toEqual({ name: 'News', dryRun: true });
+  });
+
+  it('accepts explicit live intent but no parent/nesting parameter', () => {
+    expect(createLabelSchema.parse({ name: 'News', dryRun: false }).dryRun).toBe(false);
+    expect(createLabelSchema.safeParse({ name: 'News', parent: 'Other' }).success).toBe(false);
   });
 });

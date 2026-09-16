@@ -45,19 +45,30 @@ const RESERVED_NAMES = new Set([
   'folders',
 ]);
 
-export function validateFolderName(name: string): void {
+export function validateCustomMailboxName(
+  name: string,
+  kind: 'Folder' | 'Label',
+  delimiter = '/',
+): void {
   if (name.trim().length === 0) {
-    throw new Error('Folder name must not be empty.');
+    throw new Error(`${kind} name must not be empty.`);
   }
   if (name.trim() !== name) {
-    throw new Error('Folder name must not have leading or trailing whitespace.');
+    throw new Error(`${kind} name must not have leading or trailing whitespace.`);
   }
-  if (name.includes('/')) {
-    throw new Error('Folder name must not contain "/"; use the parent parameter for nesting.');
+  if ([...name].some((character) => character.charCodeAt(0) < 32 || character === '\x7f')) {
+    throw new Error(`${kind} name must not contain control characters.`);
+  }
+  if (name === '.' || name === '..' || name.includes('/') || name.includes(delimiter)) {
+    throw new Error(`${kind} name must not contain a path delimiter or traversal segment.`);
   }
   if (RESERVED_NAMES.has(name.toLowerCase())) {
-    throw new Error(`"${name}" is a reserved folder name.`);
+    throw new Error(`"${name}" is a reserved ${kind.toLowerCase()} name.`);
   }
+}
+
+export function validateFolderName(name: string, delimiter = '/'): void {
+  validateCustomMailboxName(name, 'Folder', delimiter);
 }
 
 /**
@@ -105,10 +116,12 @@ export async function createFolder(
   }
 
   const folders = await client.list();
+  const delimiter = folders[0]?.delimiter ?? '/';
+  validateFolderName(name, delimiter);
+  if (parent) validateFolderName(parent, delimiter);
   const special = resolveSpecialFolders(folders);
   assertCreateFolderParentAllowed(special, parent);
 
-  const delimiter = folders[0]?.delimiter ?? '/';
   const path = customFolderPathFromSegments(parent ? [parent, name] : [name], delimiter);
 
   if (parent) {

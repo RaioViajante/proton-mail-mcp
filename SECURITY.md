@@ -87,10 +87,14 @@ style empty segment. See README.md ("Proton Bridge namespace: `Folders/` and `La
 Proton also enforces one shared name per account across folders and labels, even though they are
 physically distinct Bridge mailboxes — confirmed live: an existing label made Bridge reject
 `CREATE "Folders/MCP Test"` with `409 Label or folder with this name already exists`.
-`mail_create_folder` checks this locally, via `findNameConflict()` in `src/mutations/policy.ts`,
+`mail_create_folder` and `mail_create_label` check this locally, via `findNameConflict()` in `src/mutations/policy.ts`,
 before ever issuing IMAP CREATE — a known collision is reported as a structured local result
 (`conflictType`, `conflictingPath`), never sent to Bridge to fail there. See README.md
 ("Cross-namespace name collisions: folders and labels share one name per account").
+`mail_create_label` accepts one flat logical name, never a raw mailbox path. It lists mailboxes but opens
+none for writing; only an explicit `dryRun: false` with no conflict issues IMAP CREATE for `Labels/<name>`.
+It never applies the new label to a message. A controlled live CREATE validated a temporary empty label;
+no message was changed.
 
 ## Spam filtering is a persistent Proton effect
 

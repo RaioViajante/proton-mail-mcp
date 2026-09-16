@@ -12,9 +12,10 @@ import { registerMarkUnreadTool } from './tools/mark-unread.js';
 import { registerMoveTool } from './tools/move.js';
 import { registerRemoveLabelTool } from './tools/remove-label.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
+import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.2.5';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -24,11 +25,12 @@ const SERVER_VERSION = '0.2.0';
  *
  * V2 (mutation, readOnlyHint: false): mail_mark_read,
  * mail_mark_unread, mail_archive, mail_move, mail_mark_spam,
- * mail_apply_label, mail_remove_label, mail_create_folder. Every one of
- * these operates only on explicit, caller-supplied UIDs (max 25 per call —
- * see mutations/batch.ts), defaults to dryRun: true, and never deletes,
+ * mail_apply_label, mail_remove_label, mail_create_folder. Message mutations
+ * use explicit caller-supplied UIDs (max 25 per call — see mutations/batch.ts);
+ * folder creation uses an explicit name. All default to dryRun: true and never delete,
  * expunges, sends, or touches SMTP. mail_mark_spam alone has destructiveHint:
  * true because Proton may persistently filter future messages from its sender.
+ * V2.5 adds five read-only metadata analysis tools; none calls a mutation.
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -51,6 +53,8 @@ export function createServer(): McpServer {
   registerApplyLabelTool(server);
   registerRemoveLabelTool(server);
   registerCreateFolderTool(server);
+
+  registerTriageIntelligenceTools(server);
 
   return server;
 }

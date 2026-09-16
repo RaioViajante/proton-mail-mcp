@@ -12,6 +12,7 @@ import { registerMarkUnreadTool } from '../src/tools/mark-unread.js';
 import { registerMoveTool } from '../src/tools/move.js';
 import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
+import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
 
 interface CapturedRegistration {
   name: string;
@@ -49,6 +50,13 @@ const mutationRegistrars = [
   registerRemoveLabelTool,
   registerCreateFolderTool,
 ];
+const intelligenceNames = [
+  'mail_automation_candidates',
+  'mail_domain_stats',
+  'mail_mailing_list_candidates',
+  'mail_sender_stats',
+  'mail_triage_snapshot',
+];
 
 const EXPECTED_READ_ONLY_NAMES = [
   'mail_get_message',
@@ -71,7 +79,7 @@ const EXPECTED_MUTATION_NAMES = [
 // Verbs that must NEVER appear in ANY tool name in this project, V1 or V2 —
 // see README.md "V2 NÃO pode conter" / SECURITY.md.
 const BANNED_NAME_PATTERN =
-  /(delete|trash|expunge|smtp|send|reply|forward|permanent|unsubscribe|block[_-]?list|allow[_-]?list|draft.?send)/i;
+  /^mail_(delete|trash|expunge|smtp|send(?:_|$)|reply|forward|permanent|unsubscribe|block[_-]?list|allow[_-]?list|draft.?send)/i;
 
 describe('V1 read-only tool registration', () => {
   it('registers exactly the four documented read-only tool names', () => {
@@ -121,14 +129,18 @@ describe('V2 mutation tool registration', () => {
 });
 
 describe('the full tool surface', () => {
-  const allRegistrars = [...readOnlyRegistrars, ...mutationRegistrars];
+  const allRegistrars = [
+    ...readOnlyRegistrars,
+    ...mutationRegistrars,
+    registerTriageIntelligenceTools,
+  ];
 
-  it('is exactly 12 tools, matching V1 (4) + V2 (8)', () => {
+  it('is exactly 17 tools, matching V1 (4) + V2 (8) + V2.5 (5)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(12);
-    expect(new Set(names).size).toBe(12); // no accidental duplicate names
+    expect(names).toHaveLength(17);
+    expect(new Set(names).size).toBe(17); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {
@@ -142,8 +154,13 @@ describe('the full tool surface', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    for (const forbidden of ['smtp', 'send', 'reply', 'forward']) {
-      expect(names.some((name) => name.toLowerCase().includes(forbidden))).toBe(false);
+    for (const forbidden of [
+      /^mail_smtp/i,
+      /^mail_send(?:_|$)/i,
+      /^mail_reply/i,
+      /^mail_forward/i,
+    ]) {
+      expect(names.some((name) => forbidden.test(name))).toBe(false);
     }
   });
 
@@ -153,6 +170,19 @@ describe('the full tool surface', () => {
     );
     for (const forbidden of ['delete', 'trash', 'expunge']) {
       expect(names.some((name) => name.toLowerCase().includes(forbidden))).toBe(false);
+    }
+  });
+});
+
+describe('V2.5 read-only tool registration', () => {
+  it('registers only the five analysis tools with read-only annotations', () => {
+    const registrations = captureRegistrations(registerTriageIntelligenceTools);
+    expect(registrations.map((registration) => registration.name).sort()).toEqual(
+      intelligenceNames,
+    );
+    for (const registration of registrations) {
+      expect(registration.config.annotations?.readOnlyHint).toBe(true);
+      expect(registration.config.annotations?.destructiveHint).toBe(false);
     }
   });
 });

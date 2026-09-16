@@ -41,7 +41,7 @@ See [SECURITY.md](SECURITY.md) for the condensed version of these rules.
 ```
 src/
   index.ts              # process entry point; starts the server over stdio
-  server.ts              # builds the McpServer and registers all 12 tools
+  server.ts              # builds the McpServer and registers all 17 tools
   bridge/
     client.ts            # opens/closes a Bridge IMAP connection
     config.ts            # non-secret config file + macOS Keychain password lookup
@@ -557,23 +557,46 @@ None of the following exist in this codebase (not "disabled" — not implemented
 - any tool that accepts a search query, wildcard, or "everything" selector as a mutation target — message
   mutations take explicit UIDs, while folder creation takes an explicit name
 
-## V2.5 — Rules (future, not implemented)
+## V2.5 — Triage intelligence and rule proposals (read-only)
 
-A likely next step, **not built yet**: letting you describe standing triage rules in plain language, e.g.:
+The five new tools collect **deterministic facts** from a bounded window in one folder. Claude and the user
+make **semantic judgments** about receipts, newsletters, notifications, legitimate mail, and spam. These tools
+do not call V2 mutations or create rules, filters, labels, folders, or unsubscribe requests. Their output is
+transient; nothing is saved to a database, cache, telemetry service, or file.
 
-- "emails from this sender → Archive"
-- "this domain → Spam"
-- "GitHub → label Development/GitHub"
-- "receipts → label Receipts"
-- "newsletters → label Newsletter"
-- "university → label University"
+| Tool                           | Input default and ceiling                                                         | Facts returned                                                                                                                                                                                                      |
+| ------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mail_sender_stats`            | INBOX; 200 messages, max 500; optional `since`, `before`, `includeDomains` (true) | Normalized sender address and domain, counts for read/unread, List-ID, List-Unsubscribe and attachments, first/last date, up to 3 subjects and 5 UIDs; optional domain aggregates.                                  |
+| `mail_domain_stats`            | INBOX; 200, max 500; optional dates                                               | Domain actually observed in From, sender count, unread/list/header counts, bounded samples. No company identity inference.                                                                                          |
+| `mail_mailing_list_candidates` | INBOX; 200, max 500; optional dates                                               | Groups with List-ID, List-Unsubscribe, List-Unsubscribe-Post one-click, bulk/list Precedence, or repeated-sender evidence. Returns only `http`, `mailto`, or `other` unsubscribe mechanism types, never URL values. |
+| `mail_automation_candidates`   | INBOX; 200, max 500; `minMessages` default 3                                      | Repeated sender, domain, List-ID, and simple subject-prefix frequencies. `candidateForRecurringRule: true` describes recurrence; no recommended action.                                                             |
+| `mail_triage_snapshot`         | INBOX; 100, max 300; optional `since`                                             | Summary, top 10 senders/domains, and at most 30 recent metadata rows.                                                                                                                                               |
 
-The intended design (for when this is actually built): rules would either run locally through this MCP
-server (evaluated against `mail_search`-style criteria, then executed through the existing V2 mutation
-tools — no new IMAP capability required) or, where a good match exists, be converted into a native Proton
-custom filter / Sieve rule so Proton applies them server-side without this server running. Both paths would
-still go through the same explicit-UID, dry-run-first mutation model described above — a "rule" is a
-convenience for generating a batch of explicit UIDs, never a way to bypass batch limits or dry-run.
+When dates are supplied, IMAP SEARCH returns UIDs and only the newest bounded selection is fetched. Without
+dates, the fetch uses a fixed sequence range ending at the mailbox size observed under a read-only lock;
+there is no unbounded `1:*` fetch. The fetch requests ENVELOPE, flags, MIME structure, and only the named
+List-ID, List-Unsubscribe, List-Unsubscribe-Post, and Precedence headers. It never requests message source,
+body parts, or attachment bytes. Sender addresses are lowercased; aliases remain distinct. Malformed sender
+addresses are omitted from sender/domain groups. Subjects and header values are capped and remain untrusted.
+All responses carry an `untrustedDataWarning`.
+
+`List-Unsubscribe-Post: List-Unsubscribe=One-Click` is **capability metadata only**. These tools never GET or
+POST the URL, open it, send `mailto`, or emit the raw URL/token in default output or logs. Header presence
+does not prove a mailing list is legitimate or desirable. Unsubscribe remains a separate, unimplemented
+action.
+
+Future human-reviewed categories are KEEP, ARCHIVE, MOVE, LABEL, UNSUBSCRIBE CANDIDATE, SPAM CANDIDATE, and
+BLOCK CANDIDATE. The internal `RuleProposal` type in `src/analysis/proposals.ts` records a sender, domain,
+List-ID, or subject-prefix match, a proposed action, and bounded evidence. V2.5 has no tool to store, apply,
+or execute it, and the MCP makes no semantic choice on its own.
+
+Proton supports [interactive custom filters](https://proton.me/support/email-inbox-filters) and
+[advanced Sieve filters](https://proton.me/support/sieve-advanced-custom-filters) that can move mail or apply
+labels server-side while this Mac is off. A future phase may generate reviewable filter or Sieve text, but
+V2.5 neither generates installable Sieve nor accesses Proton Settings or installs filters. Proton also
+[distinguishes Spam, Block, and Allow](https://proton.me/support/spam-filtering): Spam routes mail to Spam;
+Block drops future mail; Allow bypasses spam filtering. The V2 live test observed a sender added to the Spam
+List after `mail_mark_spam`, which remains distinct from Block. No Block/Allow management exists here.
 
 ## Threat model (prompt injection via email)
 
@@ -618,7 +641,7 @@ claude mcp add --scope user proton-mail node /path/to/proton-mail-mcp/dist/index
   restrictive `--scope local` (private to you, scoped to the current project directory) works too.
 - No `-e` / environment variables and no header/token flags — there is nothing secret to pass.
 
-Verify it's registered, connects, and exposes all 12 tools:
+Verify it's registered, connects, and exposes all 17 tools:
 
 ```
 claude mcp list

@@ -113,6 +113,20 @@ header — and only to correlate the same message across two mailboxes, never to
 to take. The action is always the explicit UIDs and parameters the caller passed in; see
 `tests/prompt-injection-mutations.test.ts`.
 
+## V2.5 analysis is read-only and ephemeral
+
+The five V2.5 tools open one mailbox with `readOnly: true` and fetch at most 500 selected message metadata
+rows (300 for the snapshot). They request only ENVELOPE, flags, MIME structure, and named mailing-list
+headers; never full bodies, attachment bytes, or arbitrary authentication headers. No V2.5 module imports
+or calls a V2 mutation. No analysis result or sender list is persisted or sent to telemetry.
+
+From names/addresses, subjects, Reply-To, List-ID, List-Unsubscribe, List-Unsubscribe-Post, Precedence, and
+attachment metadata are all untrusted data. The tools do not interpret their text as commands or decide a
+semantic action. Unsubscribe URLs can contain tokens: only mechanism types (`http`, `mailto`, `other`) are
+returned. A one-click header is reported as capability metadata; no GET, POST, mailto, URL opening, browser
+automation, or unsubscribe execution occurs. See README.md ("V2.5 — Triage intelligence and rule
+proposals").
+
 ## Reporting
 
 This is a personal, local-only project with no network-facing surface beyond `127.0.0.1`. If you

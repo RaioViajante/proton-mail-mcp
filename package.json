@@ -1,8 +1,8 @@
 {
   "name": "proton-mail-mcp",
-  "version": "0.2.0",
+  "version": "0.2.5",
   "private": true,
-  "description": "Local MCP server exposing Proton Mail (via Proton Mail Bridge IMAP) to Claude Code: read-only V1 plus explicit, dry-run-by-default triage mutations in V2.",
+  "description": "Local Proton Mail Bridge MCP server with read-only mail intelligence and explicit, dry-run-by-default triage mutations.",
   "type": "module",
   "license": "UNLICENSED",
   "engines": {

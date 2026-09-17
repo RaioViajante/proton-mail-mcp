@@ -23,9 +23,11 @@ export const inputSchema = z.object({
     .array(z.string().min(1))
     .optional()
     .describe(
-      'Optional label names to reapply after restoring — Trash may have removed them. Labels are ' +
-        'validated to exist and are never created automatically; a missing label or a label that ' +
-        'fails to reapply is reported in labelsFailed without undoing the restore.',
+      'Optional EXTRA label names to guarantee on the restored message, in addition to — never ' +
+        'instead of — the labels it already carried in Trash, which are now preserved ' +
+        'automatically (0.4.1). Each extra is validated to exist and rejected before any move if ' +
+        'not (never created automatically); once applied, appears in labelsRestored alongside any ' +
+        'auto-preserved labels.',
     ),
   dryRun: z
     .boolean()
@@ -44,13 +46,18 @@ export function registerRestoreFromTrashTool(server: McpServer): void {
     {
       title: 'Restore mail from Trash',
       description:
-        'Moves explicit message UIDs out of Trash into an explicit destination folder. Defaults ' +
-        'to dryRun=true; live execution requires confirm=true and ' +
-        'acknowledgeRestoreFromTrash=true. Optionally reapplies explicit, pre-existing labels via ' +
-        'labelsToRestore — this is a separate IMAP operation from the folder move and is never ' +
-        'treated as atomic with it: if the move succeeds but a label reapply fails, the move is ' +
-        'never rolled back, and the result reports the partial outcome explicitly via ' +
-        'moveRestored / labelsRestored / labelsFailed / requiresRefresh. Only explicit UIDs you ' +
+        'Moves explicit message UIDs out of Trash into an explicit destination folder, ' +
+        "automatically preserving the message's preservable flags (\\Seen, \\Flagged) and label " +
+        'membership across the move (0.4.1) — a Bridge mailbox transition may otherwise silently ' +
+        'drop labels or flip \\Seen; this tool measures the pre-move state, re-measures it after, ' +
+        'and repairs any divergence, but only for a destination identity confirmed without ' +
+        'guessing. Defaults to dryRun=true; live execution requires confirm=true and ' +
+        'acknowledgeRestoreFromTrash=true. labelsToRestore is for EXTRA labels only, in addition ' +
+        'to — never instead of — automatic preservation; each extra is validated to exist and ' +
+        'rejected before any move if not. The folder move and any repair are separate IMAP ' +
+        'operations, never atomic: a repair failure never rolls back the move, and the result ' +
+        'reports the outcome explicitly via moveRestored / labelsRestored / labelsFailed / ' +
+        'flagsRestored / flagsFailed / requiresRefresh / partialSuccess. Only explicit UIDs you ' +
         'provide are affected.',
       inputSchema,
       annotations: {

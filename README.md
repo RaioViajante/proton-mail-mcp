@@ -16,10 +16,11 @@ model"](#mutation-model) and ["V2 mutation limitations"](#v2-mutation-limitation
 "Controlled Unsubscribe") adds a read-only `mail_unsubscribe_preview` and a single-message, consent-gated
 `mail_unsubscribe` that executes ONLY the RFC 8058 HTTPS one-click mechanism — never a body link, never
 `mailto:`, never browser automation. See ["V3 — Controlled Unsubscribe"](#v3--controlled-unsubscribe-030)
-below. **V4** (0.4.0, "Safe Trash Lifecycle") adds `mail_trash`, `mail_restore_from_trash`, and
-`mail_delete_permanently` — the last is implemented and fully unit-tested, but live execution is
-unconditionally disabled by a hard feature gate until a separate, dedicated destructive-action validation.
-See ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040) below.
+below. **V4** (0.4.0, "Safe Trash Lifecycle", hardened in 0.4.1) adds `mail_trash`,
+`mail_restore_from_trash`, and `mail_delete_permanently` — the last is implemented and fully unit-tested,
+but live execution is unconditionally disabled by a hard feature gate until a separate, dedicated
+destructive-action validation. See ["V4 — Safe Trash
+Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041) below.
 
 ## Security model
 
@@ -43,7 +44,7 @@ See ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040) below.
   SMTP/send/reply/forward tool — not "disabled," genuinely not implemented, in any version. V4 (0.4.0) adds
   `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` — implemented
   and fully unit-tested, but its live execution is unconditionally refused by a hard feature gate; see ["V4 —
-  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040).
+  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041).
 - **Email content is always labeled untrusted, and can never drive a mutation.** See ["Threat
   model"](#threat-model-prompt-injection-via-email).
 
@@ -296,7 +297,7 @@ change what a tool can actually do; the real protections are unchanged.
 | `mail_create_label`  | `name`                                                         | Creates a flat custom label under `Labels/`; does not apply it to any message. Rejects raw paths and names already used by a folder or label.                                                                                                             |
 
 V4 (0.4.0) adds three more mutation tools, described in full in ["V4 — Safe Trash
-Lifecycle"](#v4--safe-trash-lifecycle-040): `mail_trash`, `mail_restore_from_trash`, and
+Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041): `mail_trash`, `mail_restore_from_trash`, and
 `mail_delete_permanently` (implemented and dry-run capable — live execution is feature-gated off).
 
 ## Mutation model
@@ -464,6 +465,11 @@ tool consults this module rather than hardcoding folder names:
   the `Labels`/`Folders` namespace containers themselves.
 - The bare namespace containers (`Folders`, `Labels`) and any non-selectable container mailbox (IMAP
   `\Noselect`) are rejected as a source, destination, or parent — never a valid concrete target.
+- `mail_trash` refuses a `Labels/<name>` mailbox as `sourceFolder` (0.4.1, `assertTrashSourceAllowed`) — a
+  label mailbox is a view of a message that physically lives in a real folder elsewhere, never the message's
+  own location, and treating it as a destructive relocation's origin would be acting on the wrong concept
+  entirely. This is deliberately scoped to `mail_trash` only — `mail_move`/`mail_archive`'s existing source
+  handling is unchanged.
 
 ## Proton Bridge namespace: `Folders/` and `Labels/`
 
@@ -604,7 +610,7 @@ None of the following exist in this codebase, in any version:
 - rename or delete folder (only `mail_create_folder` exists so far)
 - **live permanent message deletion** — V4 (0.4.0) added `mail_delete_permanently`, fully implemented and
   unit-tested, but its live execution (`dryRun: false`) is unconditionally refused by a hard feature gate;
-  see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040)
+  see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041)
 - any tool that accepts a search query, wildcard, or "everything" selector as a mutation target — message
   mutations take explicit UIDs, while folder creation takes an explicit name; `mail_unsubscribe` takes
   exactly one explicit UID, never a batch
@@ -784,7 +790,7 @@ project does not call, wrap, or depend on that feature — `mail_unsubscribe` im
 mechanism this project's own security model explicitly supports (RFC 8058 HTTPS one-click), independently of
 whatever Proton's client does or does not do for the same message.
 
-## V4 — Safe Trash Lifecycle (0.4.0)
+## V4 — Safe Trash Lifecycle (0.4.0, hardened in 0.4.1)
 
 Three new mutation tools, all explicit-UID-only (never a search or "everything"), all defaulting to
 `dryRun: true`.
@@ -794,9 +800,34 @@ Three new mutation tools, all explicit-UID-only (never a search or "everything")
 | Capability                                     | Status                                                                          |
 | ---------------------------------------------- | ------------------------------------------------------------------------------- |
 | Move to Trash (`mail_trash`)                   | Supported (live)                                                                |
-| Restore from Trash (`mail_restore_from_trash`) | Supported (live), including optional label reapply                              |
+| Restore from Trash (`mail_restore_from_trash`) | Supported (live), automatically preserving flags/labels (0.4.1)                 |
 | Permanent delete — dry-run                     | Supported                                                                       |
 | Permanent delete — live                        | **Disabled**, unconditionally, pending a separate destructive-action validation |
+
+### 0.4.1 — state-preserving restore hardening
+
+A live validation of 0.4.0 found `mail_restore_from_trash` silently losing state on a real Trash ->
+Archive restore: two labels the message had carried intact through Trash disappeared, and `\Seen`
+flipped (unread -> read) — while the tool reported a clean success throughout, because it only ever
+measured what the caller's `labelsToRestore` explicitly asked for. 0.4.1 changes the contract:
+
+- Before any move, the message's preservable flags (`\Seen`, `\Flagged` — see `src/mutations/flags.ts`)
+  and full label membership are snapshotted while it is still in Trash.
+- After a live move — **only** for a destination identity confirmed via the same
+  UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project uses, never a
+  guess — both are re-measured, and any divergence from the snapshot is repaired automatically: a label
+  that disappeared is reapplied (never created), a flag that flipped is flipped back.
+- `labelsToRestore` no longer means "the only labels that survive" — it means EXTRA labels the caller
+  wants guaranteed, unioned and deduplicated with the automatically-preserved set. Each extra is
+  validated to exist and **rejected before any move** if it doesn't (never created automatically) — no
+  more deferring a missing label to a post-hoc `labelsFailed` entry.
+- `mail_trash`'s `sourceFolder` no longer accepts a `Labels/<name>` mailbox — see "Folder protections".
+- A `messageMove` that throws (e.g. the connection drops after the command may have already reached the
+  server) is never assumed to be a clean failure, or a clean success — see "Reconnect / uncertain
+  mutation hardening" below.
+
+See "Trash lifecycle: labels are measured, never assumed" in SECURITY.md for the full threat model this
+addresses.
 
 ### Archive vs. Trash — not the same operation
 
@@ -815,11 +846,13 @@ away:
 
 Input: `sourceFolder`, `uids` (1–25, explicit, no wildcard), `dryRun` (default `true`). Live execution
 requires **both** `confirm: true` and `acknowledgeTrashMove: true` — the same dual-confirmation shape
-`mail_mark_spam` and `mail_unsubscribe` already use. Refuses when `sourceFolder` is already Trash. Before any
-mutation, captures each matched message's current label membership (`originalLabels`) via
-Message-ID correlation against every `Labels/<name>` mailbox — see `src/mutations/label-membership.ts`.
-Message-ID itself is never returned or persisted; only label **names**, which are not secrets. After a live
-move, membership is re-measured and the result reports, per UID:
+`mail_mark_spam` and `mail_unsubscribe` already use. Refuses when `sourceFolder` is already Trash, and (0.4.1)
+refuses a `Labels/<name>` mailbox as `sourceFolder` — see "Folder protections". Before any mutation, captures
+each matched message's current label membership (`originalLabels`) and preservable flags (`originalFlags` —
+`\Seen`, `\Flagged`; see `src/mutations/flags.ts`) via Message-ID correlation against every `Labels/<name>`
+mailbox — see `src/mutations/label-membership.ts`. Message-ID itself is never returned or persisted; only
+label **names** and flag names, neither of which are secrets. After a live move, both are re-measured (for a
+UID whose destination identity in Trash was confirmed without guessing) and the result reports, per UID:
 
 ```json
 {
@@ -830,48 +863,99 @@ move, membership is re-measured and the result reports, per UID:
       "labelsAfterTrash": [],
       "labelsRemovedByTrash": ["Work"]
     }
+  ],
+  "flagImpacts": [
+    {
+      "uid": 42,
+      "originalFlags": ["\\Seen"],
+      "flagsAfterTrash": ["\\Seen"],
+      "flagsRemovedByTrash": [],
+      "flagsAddedByTrash": []
+    }
   ]
 }
 ```
 
-`mail_trash` never reapplies a removed label itself — no write to any `Labels/<name>` mailbox happens as
-part of this call. Follows the same write-lock revalidation and UIDPLUS-verified-then-Message-ID transition
-reconciliation every relocating mutation in this project already follows (see ["IMAP UID
+`mail_trash` never repairs a divergence itself — no write to any `Labels/<name>` mailbox, and no
+`messageFlagsAdd`/`messageFlagsRemove` call, happens as part of this call; `mail_restore_from_trash` is the
+tool that repairs (see below). Follows the same write-lock revalidation and UIDPLUS-verified-then-Message-ID
+transition reconciliation every relocating mutation in this project already follows (see ["IMAP UID
 semantics"](#imap-uid-semantics)); a stale UID is dropped from the batch, never mutated, and the rest of the
-batch still proceeds.
+batch still proceeds. A `messageMove` that throws is never assumed to be a clean failure — see "Reconnect /
+uncertain mutation hardening" below.
 
 ### `mail_restore_from_trash`
 
-Input: `uids` in Trash (1–25, explicit), `destinationFolder` (explicit), optional `labelsToRestore`, `dryRun`
-(default `true`). Live execution requires `confirm: true` and `acknowledgeRestoreFromTrash: true`.
-`destinationFolder` reuses `mail_move`'s exact destination policy
+Input: `uids` in Trash (1–25, explicit), `destinationFolder` (explicit), optional `labelsToRestore` (EXTRA
+labels — see below), `dryRun` (default `true`). Live execution requires `confirm: true` and
+`acknowledgeRestoreFromTrash: true`. `destinationFolder` reuses `mail_move`'s exact destination policy
 (`resolveMoveDestination`/`assertMoveDestinationAllowed` in `src/mutations/policy.ts`): Trash, Spam, Sent,
 Drafts, All Mail, a bare namespace container, or a `Labels/...` reference are all rejected. Spam is rejected
 outright rather than given its own ad-hoc acknowledgement parameter — `mail_mark_spam` already exists as the
 one, specifically-gated way to put a message in Spam.
 
-If `labelsToRestore` is given, each label is validated to exist as a real `Labels/<name>` mailbox and is
-**never created automatically**. Label reapply is a separate IMAP operation from the folder move and is
-**never presented as atomic** with it: if the move succeeds but a label fails to reapply (doesn't exist,
-IMAP rejects it, or the destination identity couldn't be confirmed without guessing), the move is **never
-rolled back** — the result reports the partial outcome explicitly:
+**Automatic state preservation (0.4.1).** Before any move, this tool snapshots each matched message's
+preservable flags and full label membership while it is still in Trash (`originalFlags`, `originalLabels`).
+After a live move — only for a UID whose destination identity was confirmed via the same
+UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project uses, never a guess —
+both are re-measured (`flagsAfterMove`, `labelsAfterMove`) and any divergence from the snapshot is repaired
+automatically: a missing label is reapplied (never created), a flipped flag is flipped back. A label present
+after the move that was NOT present before it is reported in `labelsUnexpected` but never removed
+automatically — there is no clear evidence it was this operation's doing.
+
+`labelsToRestore` means EXTRA labels the caller explicitly wants guaranteed, **in addition to — never instead
+of** — the automatically-preserved set; both are unioned and deduplicated. Each extra is validated to exist
+as a real `Labels/<name>` mailbox and **rejected before any move** (dry-run or live) if it doesn't — never
+created automatically, and never deferred to a post-hoc failure report the way an IMAP-level apply failure
+is.
+
+The folder move and any repair are separate IMAP operations and **never presented as atomic**: if the move
+succeeds but a repair fails (label doesn't exist anymore, IMAP rejects it, or the destination identity
+couldn't be confirmed/re-verified without guessing), the move is **never rolled back** — the result reports
+the outcome explicitly:
 
 ```json
 {
   "moveRestored": [42],
-  "labelsRequested": ["Work", "Ghost"],
-  "labelsRestored": [{ "uid": 42, "label": "Work" }],
-  "labelsFailed": [
-    { "uid": 42, "label": "Ghost", "reason": "Label does not exist; not created automatically." }
+  "originalFlags": [{ "uid": 42, "flags": [] }],
+  "flagsAfterMove": [{ "uid": 42, "flags": ["\\Seen"] }],
+  "flagsRestored": [{ "uid": 42, "flag": "\\Seen" }],
+  "flagsFailed": [],
+  "originalLabels": [{ "uid": 42, "labels": ["Work", "Personal"] }],
+  "labelsAfterMove": [{ "uid": 42, "labels": [] }],
+  "labelsRestored": [
+    { "uid": 42, "label": "Work" },
+    { "uid": 42, "label": "Personal" }
   ],
-  "requiresRefresh": false
+  "labelsFailed": [],
+  "labelsUnexpected": [],
+  "requiresRefresh": false,
+  "partialSuccess": false
 }
 ```
 
-A label is only ever reapplied to a UID whose destination identity was confirmed via the same UIDPLUS
-mapping / Message-ID correlation every other transition in this project uses — never to a `resultingUid`
-this project isn't sure about; when it can't be confirmed, that label attempt is reported as failed and
-`requiresRefresh: true` is set instead of guessing.
+`partialSuccess` is `true` whenever the live outcome deviated from a full, clean success in any way — a
+folder-move error, an unresolved `requiresRefresh`, or any failed flag/label repair — and `false` only when
+the move completed, every preservable flag and every original/extra label ended up exactly as intended, with
+zero unresolved uncertainty. A repair is only ever attempted for a UID whose destination identity is
+confirmed **and** whose post-move state was actually re-fetched; an unconfirmed or vanished UID is never
+guessed at — that attempt is reported as failed/`requiresRefresh` instead.
+
+### Reconnect / uncertain mutation hardening (0.4.1)
+
+`mail_trash` and `mail_restore_from_trash` both call `client.messageMove()` for their core relocation, and
+both now handle it throwing (the connection dropped, or the response was lost, at some point that could be
+before OR after the server actually processed the command) the same way: never assume a clean failure, never
+assume success, and never retry the move. `src/mutations/uncertain-move.ts` performs read-only-only
+reconciliation via Message-ID correlation (the same primitive `mutations/transitions.ts` already uses for the
+happy path) — a UID confirmed still present in the source folder is `notMoved` (reported as an error, safe to
+retry manually); a UID confirmed absent from source and present exactly once in the destination is `moved`
+(the rest of the pipeline — transitions, verification, repair — proceeds normally for it); anything that
+can't be proven either way is `uncertain` (`requiresRefresh: true`, reported, never guessed, never
+retried automatically). The same posture extends past the move itself: if a reconnect happens during
+`mail_restore_from_trash`'s post-move verification or repair, the already-successful move is never swallowed
+by the failure — `moveRestored` still reflects it, and the uncertainty is reported via `requiresRefresh` /
+`errors` instead.
 
 ### `mail_delete_permanently` (implemented; live execution disabled in 0.4.0)
 
@@ -918,9 +1002,10 @@ Proton labels are separate `Labels/<name>` mailboxes (see ["Labels vs.
 folders"](#labels-vs-folders-live-confirmed-behavior)); there is no single IMAP fetch that reports "all
 labels this message has." `src/mutations/label-membership.ts` is the one place that enumerates label
 membership, by checking Message-ID correlation against every `Labels/<name>` mailbox — used to compute
-`originalLabels`/`labelsAfterTrash` for `mail_trash` and to validate `labelsToRestore` for
-`mail_restore_from_trash`. This project keeps **no persistent "trash history" database** of any kind — it
-stays stateless, exactly like every other tool here; every label-impact result is recomputed fresh from
+`originalLabels`/`labelsAfterTrash` for `mail_trash` and `originalLabels`/`labelsAfterMove` for
+`mail_restore_from_trash` (0.4.1: also used to decide what to automatically reapply, not just to validate
+`labelsToRestore` extras). This project keeps **no persistent "trash history" database** of any kind — it
+stays stateless, exactly like every other tool here; every label/flag-impact result is recomputed fresh from
 live IMAP state on each call.
 
 ## Threat model (prompt injection via email)
@@ -950,7 +1035,7 @@ This server's defenses:
    `acknowledgeRestoreFromTrash: true`; `mail_delete_permanently` requires all of `dryRun: false`,
    `confirm: true`, `acknowledgePermanentDeletion: true`, AND `confirmationPhrase` exactly
    `"DELETE PERMANENTLY"` — and even then, live execution is unconditionally refused by a feature gate. See
-   ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040).
+   ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041).
 4. **No raw HTML, bounded size.** HTML-only messages are converted to inert plain text before being returned,
    and bodies are capped at 20,000 characters.
 5. **`List-Unsubscribe` is treated as hostile input, structurally.** `mail_unsubscribe` never reads the

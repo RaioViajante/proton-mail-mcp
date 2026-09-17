@@ -221,14 +221,65 @@ preserves or clears them. `src/mutations/label-membership.ts` enumerates label m
 correlation against every `Labels/<name>` mailbox, read-only (`SEARCH` only, never a write), before and
 after a `mail_trash` move, and the result reports the measured diff (`originalLabels`, `labelsAfterTrash`,
 `labelsRemovedByTrash`) — never a prediction. `mail_trash` never reapplies a label itself.
-`mail_restore_from_trash`'s optional `labelsToRestore` validates each label exists as a real mailbox (never
-auto-created) and only reapplies to a UID whose destination identity was confirmed via the same
-UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project uses — never to a
-UID it isn't sure about. The folder restore and any label reapply are separate IMAP operations; a label
-failure never rolls back the folder move, and the result reports the partial outcome explicitly
-(`labelsRestored` / `labelsFailed` / `requiresRefresh`) rather than hiding it. This project keeps no
-persistent "trash history" of any kind — every label-impact result is recomputed fresh from live IMAP state
-on each call, exactly like every other tool here.
+
+## Live finding (0.4.0) and state-preserving restore hardening (0.4.1)
+
+A live validation of 0.4.0 moved one real message Archive -> Trash -> Archive to test the trash lifecycle
+end to end. The Archive -> Trash leg behaved exactly as documented: identity reconciled, flags preserved,
+labels preserved, nothing removed. The Trash -> Archive restore did not: **two labels the message had
+carried intact through Trash disappeared, and its unread state flipped to read — and
+`mail_restore_from_trash` reported a clean success throughout**, because 0.4.0's implementation only ever
+measured/reapplied what the caller's `labelsToRestore` explicitly asked for. It had no mechanism to notice
+that Bridge's plain folder MOVE out of Trash, on its own, silently mutated state the caller never asked it
+to touch.
+
+**Root cause.** Proton Bridge does not guarantee a mailbox transition is a pure, structural relocation —
+labels and flags can be mutated as a side effect, in either direction (into Trash, or out of it), and this
+project's 0.4.0 code only checked for it on the way in. Post-move state was trusted by omission rather than
+verified.
+
+**The fix, applied to `mail_restore_from_trash` (0.4.1):**
+
+- **Snapshot before trusting anything.** Preservable flags (`\Seen`, `\Flagged` — an explicit whitelist,
+  see `src/mutations/flags.ts`; never an arbitrary flag copied blindly) and full label membership are
+  captured while the message is still in Trash, before any move.
+- **Post-move state is untrusted until re-verified.** After a live move, both are re-measured in the
+  destination folder — never assumed equal to the snapshot just because the move command succeeded.
+- **Identity must be proven before repair.** A label or flag is only ever reapplied to a UID whose
+  destination identity was confirmed via the same UIDPLUS-verified-then-Message-ID reconciliation every
+  other transition in this project uses (`mutations/transitions.ts`) — an unconfirmed or vanished UID is
+  never guessed at; that repair attempt is reported as failed / `requiresRefresh` instead of acting on a UID
+  this project isn't sure about.
+- **Repair is limited to known pre-move state.** Only a label/flag present in the snapshot and now missing
+  is reapplied; a label present after the move that was NOT in the snapshot is reported
+  (`labelsUnexpected`) but never removed automatically — there is no reliable way to prove it was this
+  operation's doing rather than something else's, and removing an unrelated label would be a new, unrelated
+  mutation this call was never authorized to make. No flag outside the fixed whitelist is ever touched.
+- **`labelsToRestore` is no longer a substitute for preservation.** It now means EXTRA labels the caller
+  explicitly wants, unioned with the automatically-preserved set, never instead of it — and each extra is
+  validated to exist and **rejected before any move** if it doesn't, rather than deferred to a post-hoc
+  failure.
+- **The folder move and any repair remain non-atomic**, exactly as in 0.4.0: a repair failure never rolls
+  back the move; the result reports `moveRestored` / `flagsRestored` / `flagsFailed` / `labelsRestored` /
+  `labelsFailed` / `requiresRefresh` / `partialSuccess` explicitly.
+- **`mail_trash`'s `sourceFolder` no longer accepts a `Labels/<name>` mailbox** (`assertTrashSourceAllowed`
+  in `src/mutations/policy.ts`) — a label mailbox is a view of a message, not its physical location, and
+  was never a meaningful origin for a destructive relocation to begin with.
+- **A `messageMove` that throws is never assumed to be a clean failure or a clean success.** The connection
+  or response may have been lost at any point relative to the server processing the command.
+  `src/mutations/uncertain-move.ts` performs read-only-only reconciliation via Message-ID correlation (the
+  same primitive the happy path already uses) to classify each affected UID as confirmed moved, confirmed
+  not moved, or genuinely uncertain — never guessed, never automatically retried, and never a second `MOVE`
+  issued for a UID whose fate is unknown (no double-move risk). This applies to both `mail_trash` and
+  `mail_restore_from_trash`, and to a reconnect at any point in `mail_restore_from_trash`'s pipeline
+  (post-move verification, label repair, flag repair) — an already-successful move is never swallowed by a
+  later failure; `moveRestored` still reflects it, and the uncertainty is surfaced via `requiresRefresh` /
+  `errors` instead.
+
+This project keeps no persistent "trash history" of any kind — every label/flag-impact result is
+recomputed fresh from live IMAP state on each call, exactly like every other tool here. No detail of the
+specific message used in the live validation is recorded anywhere in this repository; only the structural
+bug and the fix are.
 
 ## Why permanent delete is feature-gated off in 0.4.0
 

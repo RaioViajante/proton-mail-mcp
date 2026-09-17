@@ -5,6 +5,7 @@ import { asImapFlow, createFakeImapClient, fakeFolder } from './fakes/imap-clien
 
 const folders = [
   fakeFolder({ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }),
+  fakeFolder({ path: 'Archive', name: 'Archive', specialUse: '\\Archive' }),
   fakeFolder({ path: 'Trash', name: 'Trash', specialUse: '\\Trash' }),
   fakeFolder({ path: 'Labels/Work', name: 'Work' }),
   fakeFolder({ path: 'Labels/Personal', name: 'Personal' }),
@@ -124,6 +125,70 @@ describe('mail_trash (trashMessages) — batch limits', () => {
     expect(result.requestedUids).toEqual([10, 10, 10]);
     expect(result.matchedUids).toEqual([10]);
   });
+});
+
+describe('mail_trash (trashMessages) — sourceFolder policy (0.4.1)', () => {
+  it('rejects a Labels/<name> mailbox as sourceFolder', async () => {
+    const fake = createFakeImapClient({ folders });
+    await expect(
+      trashMessages(asImapFlow(fake), {
+        sourceFolder: 'Labels/Work',
+        uids: [10],
+        dryRun: true,
+        confirm: false,
+        acknowledgeTrashMove: false,
+      }),
+    ).rejects.toThrow(/label mailbox/i);
+    expect(fake.getMailboxLock).not.toHaveBeenCalled();
+  });
+
+  it('rejects the bare "Labels" namespace container as sourceFolder', async () => {
+    const fake = createFakeImapClient({ folders });
+    await expect(
+      trashMessages(asImapFlow(fake), {
+        sourceFolder: 'Labels',
+        uids: [10],
+        dryRun: true,
+        confirm: false,
+        acknowledgeTrashMove: false,
+      }),
+    ).rejects.toThrow(/label mailbox/i);
+  });
+
+  it.each(['INBOX', 'Archive'])('still allows %s as sourceFolder', async (sourceFolder) => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        [sourceFolder]: { fetchResults: [fakeMessage(10, '<a@example.com>')] },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+    });
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder,
+      uids: [10],
+      dryRun: true,
+      confirm: false,
+      acknowledgeTrashMove: false,
+    });
+    expect(result.matchedUids).toEqual([10]);
+  });
+
+  it.each(['Folders', 'DoesNotExist/../INBOX'])(
+    'rejects a malformed or nonexistent sourceFolder path: %s',
+    async (sourceFolder) => {
+      const fake = createFakeImapClient({ folders });
+      await expect(
+        trashMessages(asImapFlow(fake), {
+          sourceFolder,
+          uids: [10],
+          dryRun: true,
+          confirm: false,
+          acknowledgeTrashMove: false,
+        }),
+      ).rejects.toThrow();
+    },
+  );
 });
 
 describe('mail_trash (trashMessages) — folder validation', () => {
@@ -506,5 +571,199 @@ describe('mail_trash (trashMessages) — untrusted content', () => {
     expect(result.changedUids).toEqual([10]);
     expect(fake.messageMove).toHaveBeenCalledTimes(1);
     expect(fake.messageMove).toHaveBeenCalledWith([10], 'Trash', { uid: true });
+  });
+});
+
+describe('mail_trash (trashMessages) — flag semantics (0.4.1)', () => {
+  it('captures originalFlags before the move, unconditionally (dry-run too)', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: {
+          fetchResults: [
+            {
+              seq: 10,
+              uid: 10,
+              envelope: { messageId: '<a@example.com>' },
+              flags: new Set(['\\Seen']),
+            },
+          ],
+        },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: true,
+      confirm: false,
+      acknowledgeTrashMove: false,
+    });
+
+    expect(result.flagImpacts).toEqual([{ uid: 10, originalFlags: ['\\Seen'] }]);
+  });
+
+  it('measures a flag divergence after a live move, without repairing it (mail_trash never auto-repairs)', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: { fetchResults: [{ seq: 10, uid: 10, envelope: { messageId: '<a@example.com>' } }] },
+        // No \Seen before the move, \Seen present after — divergence.
+        Trash: {
+          fetchResults: [
+            {
+              seq: 3,
+              uid: 3,
+              envelope: { messageId: '<a@example.com>' },
+              flags: new Set(['\\Seen']),
+            },
+          ],
+        },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+      moveResult: { path: 'INBOX', destination: 'Trash', uidMap: new Map([[10, 3]]) },
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: false,
+      confirm: true,
+      acknowledgeTrashMove: true,
+    });
+
+    expect(result.flagImpacts).toEqual([
+      {
+        uid: 10,
+        originalFlags: [],
+        flagsAfterTrash: ['\\Seen'],
+        flagsRemovedByTrash: [],
+        flagsAddedByTrash: ['\\Seen'],
+      },
+    ]);
+    expect(fake.messageFlagsAdd).not.toHaveBeenCalled();
+    expect(fake.messageFlagsRemove).not.toHaveBeenCalled();
+  });
+
+  it('does not measure flagsAfterTrash for a uid whose destination identity was not confirmed', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: { fetchResults: [{ seq: 10, uid: 10, envelope: { messageId: '<a@example.com>' } }] },
+        Trash: {
+          fetchResults: [{ seq: 3, uid: 3, envelope: { messageId: '<different@example.com>' } }],
+        },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+      moveResult: { path: 'INBOX', destination: 'Trash', uidMap: new Map([[10, 3]]) },
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: false,
+      confirm: true,
+      acknowledgeTrashMove: true,
+    });
+
+    expect(result.flagImpacts[0]?.flagsAfterTrash).toBeUndefined();
+  });
+});
+
+describe('mail_trash (trashMessages) — reconnect / uncertain move (0.4.1)', () => {
+  it('reconnect after MOVE before response: read-only reconciliation confirms the move without a second attempt', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: {
+          fetchResults: [{ seq: 10, uid: 10, envelope: { messageId: '<a@example.com>' } }],
+          searchResult: [],
+        },
+        Trash: {
+          fetchResults: [{ seq: 3, uid: 3, envelope: { messageId: '<a@example.com>' } }],
+          searchResult: [3],
+        },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+    });
+    fake.messageMove.mockImplementationOnce(() => {
+      throw new Error('socket hang up');
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: false,
+      confirm: true,
+      acknowledgeTrashMove: true,
+    });
+
+    expect(result.changedUids).toEqual([10]);
+    expect(fake.messageMove).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconnect with a confirmed non-move is reported as an error, not silently dropped', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: {
+          fetchResults: [{ seq: 10, uid: 10, envelope: { messageId: '<a@example.com>' } }],
+          searchResult: [10],
+        },
+        Trash: { fetchResults: [], searchResult: [] },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+    });
+    fake.messageMove.mockImplementationOnce(() => {
+      throw new Error('socket hang up');
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: false,
+      confirm: true,
+      acknowledgeTrashMove: true,
+    });
+
+    expect(result.changedUids).toEqual([]);
+    expect(result.errors).toEqual([{ uid: 10, message: 'socket hang up' }]);
+    expect(fake.messageMove).toHaveBeenCalledTimes(1);
+  });
+
+  it('a genuinely unprovable outcome sets requiresRefresh, never guesses, never retries', async () => {
+    const fake = createFakeImapClient({
+      folders,
+      mailboxes: {
+        INBOX: {
+          fetchResults: [{ seq: 10, uid: 10, envelope: { messageId: '<a@example.com>' } }],
+          searchResult: [],
+        },
+        Trash: { fetchResults: [], searchResult: [] },
+        'Labels/Work': { searchResult: [] },
+        'Labels/Personal': { searchResult: [] },
+      },
+    });
+    fake.messageMove.mockImplementationOnce(() => {
+      throw new Error('socket hang up');
+    });
+
+    const result = await trashMessages(asImapFlow(fake), {
+      sourceFolder: 'INBOX',
+      uids: [10],
+      dryRun: false,
+      confirm: true,
+      acknowledgeTrashMove: true,
+    });
+
+    expect(result.changedUids).toEqual([]);
+    expect(result.requiresRefresh).toBe(true);
+    expect(fake.messageMove).toHaveBeenCalledTimes(1);
   });
 });

@@ -21,7 +21,7 @@ import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.4.0';
+const SERVER_VERSION = '0.4.1';
 
 /**
  * Builds the MCP server and registers every tool.

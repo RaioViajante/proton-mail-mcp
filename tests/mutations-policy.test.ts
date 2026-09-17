@@ -3,8 +3,10 @@ import {
   assertCreateFolderParentAllowed,
   assertFolderExists,
   assertMoveDestinationAllowed,
+  assertTrashSourceAllowed,
   customFolderPathFromSegments,
   findNameConflict,
+  isLabelMailboxPath,
   isNamespaceContainer,
   isSelectable,
   resolveCustomFolderReference,
@@ -238,6 +240,42 @@ describe('resolveMoveDestination', () => {
 
   it('rejects the bare "Folders" namespace root', () => {
     expect(() => resolveMoveDestination(special, 'Folders', '/')).toThrow(/namespace container/i);
+  });
+});
+
+describe('isLabelMailboxPath', () => {
+  it('is true for the bare "Labels" container', () => {
+    expect(isLabelMailboxPath('Labels', '/')).toBe(true);
+  });
+
+  it('is true for a concrete Labels/<name> mailbox', () => {
+    expect(isLabelMailboxPath('Labels/Work', '/')).toBe(true);
+    expect(isLabelMailboxPath('Labels/Newsletters e ofertas', '/')).toBe(true);
+  });
+
+  it('is false for an ordinary folder, even one containing "Labels" as a substring', () => {
+    expect(isLabelMailboxPath('INBOX', '/')).toBe(false);
+    expect(isLabelMailboxPath('Archive', '/')).toBe(false);
+    expect(isLabelMailboxPath('Folders/Labels Archive', '/')).toBe(false);
+  });
+
+  it('respects the given delimiter', () => {
+    expect(isLabelMailboxPath('Labels.Work', '.')).toBe(true);
+    expect(isLabelMailboxPath('Labels/Work', '.')).toBe(false);
+  });
+});
+
+describe('assertTrashSourceAllowed', () => {
+  it('rejects a concrete Labels/<name> mailbox as a trash source', () => {
+    expect(() => assertTrashSourceAllowed('Labels/Work', '/')).toThrow(/label mailbox/i);
+  });
+
+  it('rejects the bare "Labels" container as a trash source', () => {
+    expect(() => assertTrashSourceAllowed('Labels', '/')).toThrow(/label mailbox/i);
+  });
+
+  it.each(['INBOX', 'Archive', 'Folders/Projects'])('allows %s as a trash source', (path) => {
+    expect(() => assertTrashSourceAllowed(path, '/')).not.toThrow();
   });
 });
 

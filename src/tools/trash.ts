@@ -8,7 +8,10 @@ export const inputSchema = z.object({
   sourceFolder: z
     .string()
     .min(1)
-    .describe('Source folder path, e.g. "INBOX". Must not already be Trash.'),
+    .describe(
+      'Source folder path, e.g. "INBOX". Must not already be Trash, and must not be a ' +
+        'Labels/... reference (a label is a view of a message, not its physical location).',
+    ),
   uids: z
     .array(z.number().int().positive())
     .min(1)
@@ -34,14 +37,19 @@ export function registerTrashTool(server: McpServer): void {
     {
       title: 'Move mail to Trash',
       description:
-        'Moves explicit message UIDs from a folder to Trash. Defaults to dryRun=true; live ' +
-        'execution requires confirm=true and acknowledgeTrashMove=true. Recoverable via ' +
-        "mail_restore_from_trash. Proton may remove some or all of a message's labels when it " +
-        'enters Trash — this tool measures that rather than assuming it, and never reapplies a ' +
-        "label automatically; see the result's labelImpacts (originalLabels, labelsAfterTrash, " +
-        'labelsRemovedByTrash per UID). Only explicit UIDs you provide are affected — never a ' +
-        'search or "everything in this folder". UIDs are mailbox-local and may change after this ' +
-        'move; check the result\'s "transitions" for the resultingUid (or requiresRefresh) in Trash.',
+        'Moves explicit message UIDs from a folder to Trash. sourceFolder must not already be ' +
+        'Trash and must not be a Labels/... reference (rejected — a label is a view of a message, ' +
+        'not its physical location). Defaults to dryRun=true; live execution requires ' +
+        'confirm=true and acknowledgeTrashMove=true. Recoverable via mail_restore_from_trash. ' +
+        "Proton may remove some or all of a message's labels, or change its flags (\\Seen, " +
+        '\\Flagged), when it enters Trash — this tool measures that rather than assuming it, and ' +
+        "never reapplies/repairs anything itself; see the result's labelImpacts (originalLabels, " +
+        'labelsAfterTrash, labelsRemovedByTrash) and flagImpacts (originalFlags, flagsAfterTrash, ' +
+        'flagsRemovedByTrash, flagsAddedByTrash) per UID. Only explicit UIDs you provide are ' +
+        'affected — never a search or "everything in this folder". UIDs are mailbox-local and may ' +
+        'change after this move; check the result\'s "transitions" for the resultingUid (or ' +
+        'requiresRefresh) in Trash — a connection drop after the move command is sent is never ' +
+        'assumed to be a clean failure or success, only confirmed read-only.',
       inputSchema,
       annotations: {
         readOnlyHint: false,

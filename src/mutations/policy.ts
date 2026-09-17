@@ -138,6 +138,40 @@ export function isNamespaceContainer(path: string): boolean {
 }
 
 /**
+ * True for the bare `Labels` container or any `Labels/<name>` mailbox. A
+ * label mailbox is a *view* of messages that physically live in a real
+ * folder elsewhere (see README.md "Labels vs. folders") — never a
+ * message's own location.
+ */
+export function isLabelMailboxPath(path: string, delimiter: string): boolean {
+  const prefix = `${LABELS_CONTAINER}${delimiter}`;
+  return path === LABELS_CONTAINER || path.startsWith(prefix);
+}
+
+/**
+ * Guards `mail_trash`'s `sourceFolder` specifically — not the shared
+ * move/archive path, which is deliberately left unchanged (see
+ * `mutations/move.ts`, `mutations/archive.ts`). A label mailbox must never
+ * be accepted as the origin of a destructive relocation: it is a view of a
+ * message, not the physical location the message is being relocated away
+ * from, and treating it as one would move the message's real copy out of
+ * whatever folder it actually lives in based on nothing but which label
+ * view happened to be queried. `assertFolderExists` already rejects the
+ * bare `Folders`/`Labels` namespace containers (both `\Noselect`) and any
+ * path that isn't a real, listed mailbox — this only adds the one gap that
+ * check leaves open: a concrete, selectable `Labels/<name>` mailbox.
+ */
+export function assertTrashSourceAllowed(sourceFolder: string, delimiter: string): void {
+  if (isLabelMailboxPath(sourceFolder, delimiter)) {
+    throw new Error(
+      `"${sourceFolder}" is a label mailbox, not a physical location — it is a view of a message ` +
+        "that lives in a real folder elsewhere. Use the message's real folder as sourceFolder for " +
+        'mail_trash, not a Labels/... reference.',
+    );
+  }
+}
+
+/**
  * Builds the real Bridge path for a custom folder from logical path
  * segments (e.g. `["Projects", "GitHub"]` with delimiter `/` →
  * `"Folders/Projects/GitHub"`). This is the single place that prepends the

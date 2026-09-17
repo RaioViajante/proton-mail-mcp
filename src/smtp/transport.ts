@@ -93,6 +93,9 @@ export interface SmtpMessage {
   cc: string[];
   subject: string;
   text: string;
+  /** 0.5.2 — reply threading headers. Always derived internally (`src/smtp/reply-intent.ts`'s `buildReplyMessage`); `mail_send` never sets these. */
+  inReplyTo?: string;
+  references?: string[];
 }
 
 /** Sends the live message. Overridable in tests so no test ever opens a real socket — mirrors `unsubscribe/execute.ts`'s injectable `OneClickSender`. */
@@ -101,7 +104,8 @@ export type SmtpSendFn = (
   message: SmtpMessage,
 ) => Promise<SmtpSuccessInfo>;
 
-async function defaultSmtpSend(
+/** Exported for direct unit testing of the `SmtpMessage` -> nodemailer options mapping (0.5.2) — every other test in `smtp-transport.test.ts` exercises `submitSmtp` with a custom `sendFn` that bypasses this function entirely. */
+export async function defaultSmtpSend(
   transporter: Transporter,
   message: SmtpMessage,
 ): Promise<SmtpSuccessInfo> {
@@ -111,6 +115,10 @@ async function defaultSmtpSend(
     cc: message.cc.length > 0 ? message.cc : undefined,
     subject: message.subject,
     text: message.text,
+    ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}),
+    ...(message.references && message.references.length > 0
+      ? { references: message.references }
+      : {}),
   });
 }
 

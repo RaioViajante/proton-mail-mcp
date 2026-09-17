@@ -52,3 +52,50 @@ describe('consumeReceiptNonce', () => {
     expect(result.consumed).toBe(true);
   });
 });
+
+describe('0.5.2 — purpose-prefixed nonces (reply/forward share this module, unmodified)', () => {
+  beforeEach(() => {
+    resetReplayGuardForTests();
+  });
+
+  it('the same 32-hex id, prefixed differently for send/reply/forward, is independently consumable under each prefix', () => {
+    const id = 'e'.repeat(32);
+    const send = consumeReceiptNonce(id, NOW + TTL_MS, NOW);
+    const reply = consumeReceiptNonce(`reply:${id}`, NOW + TTL_MS, NOW);
+    const forward = consumeReceiptNonce(`forward:${id}`, NOW + TTL_MS, NOW);
+    expect(send.consumed).toBe(true);
+    expect(reply.consumed).toBe(true);
+    expect(forward.consumed).toBe(true);
+  });
+
+  it('a reply nonce cannot be replayed under the reply prefix once consumed', () => {
+    const id = `reply:${'f'.repeat(32)}`;
+    consumeReceiptNonce(id, NOW + TTL_MS, NOW);
+    const second = consumeReceiptNonce(id, NOW + TTL_MS, NOW + 1);
+    expect(second.consumed).toBe(false);
+  });
+
+  it('a forward nonce cannot be replayed under the forward prefix once consumed', () => {
+    const id = `forward:${'a1'.repeat(16)}`;
+    consumeReceiptNonce(id, NOW + TTL_MS, NOW);
+    const second = consumeReceiptNonce(id, NOW + TTL_MS, NOW + 1);
+    expect(second.consumed).toBe(false);
+  });
+
+  it('consuming a reply-prefixed nonce does not consume the same bare id (send) or forward-prefixed id', () => {
+    const bareId = 'b2'.repeat(16);
+    consumeReceiptNonce(`reply:${bareId}`, NOW + TTL_MS, NOW);
+    expect(consumeReceiptNonce(bareId, NOW + TTL_MS, NOW).consumed).toBe(true);
+    expect(consumeReceiptNonce(`forward:${bareId}`, NOW + TTL_MS, NOW).consumed).toBe(true);
+  });
+
+  it('concurrency: two "simultaneous" consume calls for the identical prefixed id — only the first wins', () => {
+    const id = `reply:${'c3'.repeat(16)}`;
+    const results = [
+      consumeReceiptNonce(id, NOW + TTL_MS, NOW),
+      consumeReceiptNonce(id, NOW + TTL_MS, NOW),
+    ];
+    const consumedCount = results.filter((r) => r.consumed).length;
+    expect(consumedCount).toBe(1);
+  });
+});

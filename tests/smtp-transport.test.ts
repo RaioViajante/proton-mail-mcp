@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Transporter } from 'nodemailer';
 import type { ResolvedSmtpConfig } from '../src/smtp/config.js';
-import { createSmtpTransport, submitSmtp } from '../src/smtp/transport.js';
+import { createSmtpTransport, defaultSmtpSend, submitSmtp } from '../src/smtp/transport.js';
 
 describe('createSmtpTransport', () => {
   let dir: string;
@@ -220,5 +221,49 @@ describe('submitSmtp — controlled fakes, never a real socket', () => {
     // would surface that as a hang. Reaching this assertion at all is the
     // signal; asserting the promise resolves (not hangs) is the real check.
     await expect(submitSmtp(config, 'pw', message, sendFn)).resolves.toBeDefined();
+  });
+});
+
+describe('defaultSmtpSend — SmtpMessage -> nodemailer options mapping (0.5.2 threading)', () => {
+  function fakeTransporter(): { sendMail: ReturnType<typeof vi.fn>; transporter: Transporter } {
+    const sendMail = vi
+      .fn()
+      .mockResolvedValue({ accepted: ['a@example.com'], rejected: [], response: '250 OK' });
+    return { sendMail, transporter: { sendMail } as unknown as Transporter };
+  }
+
+  const message = {
+    from: 'user@proton.me',
+    to: ['a@example.com'],
+    cc: [],
+    subject: 'Hi',
+    text: 'Hello',
+  };
+
+  it('sets inReplyTo/references on the nodemailer call when present', async () => {
+    const { sendMail, transporter } = fakeTransporter();
+    await defaultSmtpSend(transporter, {
+      ...message,
+      inReplyTo: '<abc@example.com>',
+      references: ['<abc@example.com>', '<def@example.com>'],
+    });
+    const [options] = sendMail.mock.calls[0] as [{ inReplyTo?: string; references?: string[] }];
+    expect(options.inReplyTo).toBe('<abc@example.com>');
+    expect(options.references).toEqual(['<abc@example.com>', '<def@example.com>']);
+  });
+
+  it('regression: a plain mail_send-shaped message (no threading fields) never sets inReplyTo/references', async () => {
+    const { sendMail, transporter } = fakeTransporter();
+    await defaultSmtpSend(transporter, message);
+    const [options] = sendMail.mock.calls[0] as [{ inReplyTo?: string; references?: string[] }];
+    expect(options.inReplyTo).toBeUndefined();
+    expect(options.references).toBeUndefined();
+  });
+
+  it('an empty references array is also omitted, not sent as []', async () => {
+    const { sendMail, transporter } = fakeTransporter();
+    await defaultSmtpSend(transporter, { ...message, references: [] });
+    const [options] = sendMail.mock.calls[0] as [{ references?: string[] }];
+    expect(options.references).toBeUndefined();
   });
 });

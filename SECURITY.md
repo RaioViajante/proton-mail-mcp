@@ -645,11 +645,127 @@ instance — not invented in advance. Discovering this behavior is exactly the k
 live-validation task (see "Live SMTP submission (0.5.1)" above) exists to do, with no polling loop or
 guess coded in ahead of that observation.
 
+## Controlled Reply & Forward (0.5.2) — threat models
+
+`mail_reply_preview`/`mail_reply` and `mail_forward_preview`/`mail_forward` reuse `mail_send`'s
+loopback-only transport and every 0.5.0/0.5.1 protection, plus the additional threat surface reply
+and forward introduce by deriving parts of the outbound message from an attacker-controlled source
+message. Live submission for both is unconditionally feature-gated off in 0.5.2 (see "Live reply/
+forward is disabled" below) — every threat model here is evaluated against what preview and dry-run
+can already do today, since that is the entire reachable surface until a future task lifts the gate.
+
+**Malicious `Reply-To`.** A sender fully controls their own `Reply-To` header. The threat: an
+attacker sets `Reply-To` to a third party, or to multiple addresses, hoping a reply silently goes
+somewhere the human user didn't intend. Defense: at most one address is ever accepted — a `Reply-To`
+header that is present but resolves to zero or more than one usable address makes the reply
+**ineligible**, never a silent fallback or an expansion to multiple recipients (`src/smtp/reply-
+intent.ts`'s `deriveRecipient`). Because some IMAP servers copy `From` into a parsed `Reply-To` slot
+when the header doesn't actually exist (RFC 3501), the raw header's **presence** is checked
+independently via a direct header fetch (`src/mail/source-message.ts`), not inferred from whether
+the parsed address list happens to be non-empty — this is exactly what stops a "header technically
+absent" case from being silently treated as "header present, use it."
+
+**Reply-all amplification.** There is no mechanism, gated or otherwise, that expands a reply to
+more than one recipient — `ReplyIntent.to` and `ReplyIntentReceiptEnvelope.to` are both typed as a
+single string, never an array, so accepting more than one address is a schema-level impossibility,
+not a runtime check that could regress. `tests/smtp-reply-intent.test.ts` and `tests/tool-
+registration.test.ts` both pin this down structurally.
+
+**Threading header injection.** The threat: a malicious source message's `Message-ID`/`References`
+headers could be crafted to inject additional headers, oversized data, or misleading thread
+correlation into the outbound reply. Defense: `In-Reply-To`/`References` are never caller-suppliable
+(no such field exists in `mail_reply`'s input schema) and are derived exclusively from the source's
+own headers through a strict validator (`MESSAGE_ID_PATTERN`, a conservative `<local@domain>` shape,
+plus `MAX_MESSAGE_ID_LENGTH`); the raw `References` header is additionally bounded by byte length
+(`MAX_REFERENCES_HEADER_BYTES`, checked before any parsing) and, once parsed, by count
+(`MAX_REFERENCES_COUNT`, oldest ids dropped first). Any id or chain that doesn't pass validation is
+discarded wholesale (never partially trusted), and a missing/malformed `Message-ID` simply disables
+threading rather than fabricating one. The raw values never appear in any tool's JSON output — only a
+content hash (`threadingHash`) is bound in the receipt.
+
+**Malicious forwarded body.** The threat: the source message's body contains prompt-injection text
+("ignore previous instructions...") or fabricated header-like lines intended to manipulate the
+assistant or forge additional visible headers in the forwarded block. Defenses, layered: (1) the
+model itself never derives recipients, subject, or any control-flow decision from body content — it
+is only ever copied byte-for-byte into a fixed template; (2) `From`/`Date`/`Subject`/`To` shown
+inside that template are passed through `sanitizeForwardedHeaderField` (control characters including
+CR/LF collapsed, whitespace normalized, length-capped), so a header value can never forge an
+additional line inside the visible forwarded block; (3) the forwarded body is plain-text only — HTML
+sources are converted, never forwarded as HTML, closing the classic HTML/rich-content injection
+vector. See `tests/tool-forward.test.ts`'s "prompt-injection regression" suite and
+`tests/smtp-forward-intent.test.ts`'s header-normalization tests.
+
+**Attachment omission.** No attachment is ever included in a forward — there is no code path that
+reads attachment content at all (`fetchForwardSourceContent` uses `BODYSTRUCTURE` purely to detect
+_presence_, never to download attachment bytes). The risk this section actually guards against is
+different: a caller (human or automated) not realizing attachments were silently dropped, and
+mistakenly believing a complete message was forwarded. `mail_forward_preview` surfaces
+`sourceHasAttachments`/`attachmentsWillBeOmitted` explicitly, and a live `mail_forward` call requires
+`acknowledgeAttachmentsWillBeOmitted: true` whenever the **cryptographically verified receipt**
+(not an unverified caller-supplied flag) says the source has attachments — see
+`tests/smtp-forward-send.test.ts` ("attachment ack is checked against the VERIFIED receipt").
+
+**Source changes after preview.** The threat: the message a caller previewed differs from the
+message actually present at send time (edited, replaced, or a different message entirely reachable
+at the same folder/UID after some other operation) — an "intent substitution" via the source rather
+than via the caller's own payload. Defense: `sendReply`/`sendForward` are never handed a
+cached/reused source — the tool handler performs a **fresh** read-only fetch immediately before
+calling them, and the core function re-derives the entire intent (recipient, subject, threading/
+content, and the keyed `sourceFingerprint` binding `folder`+`UIDVALIDITY`+`uid`+`From`+`Subject`+
+`Date`, with `Message-ID` folded in only when present) from that fresh fetch, comparing it against
+the receipt's bound values. Any drift — a different fingerprint, a different derived recipient/
+subject, a different content hash — fails closed before any credential is requested or any SMTP
+connection opens. `tests/smtp-reply-send.test.ts`/`smtp-forward-send.test.ts` ("source
+revalidation") exercise this directly, including a Reply-To that changed since preview and a
+forwarded body that changed since preview.
+
+**Intent substitution (preview A, submit B).** Structurally the same class of attack
+`send-intent-receipt.ts` already closes for `mail_send`: the receipt binds a signed, exact snapshot
+of what was previewed (recipient/subject/text-hash/threading-hash or content-hashes/source
+fingerprint), and live submission re-derives the current intent and requires a byte-for-byte match
+before proceeding — a caller cannot preview one message and submit a different one under the same
+receipt, whether the difference originates from tampered call arguments or a changed source message.
+
+**Receipt cross-purpose attacks.** The threat: a valid `sendIntentReceipt` (or a `forwardIntentReceipt`)
+being presented to `mail_reply`, hoping shared signing infrastructure lets it verify. Defense,
+layered: (1) each receipt type has its own Zod schema with a distinct required field set (a reply
+receipt's `to` is a single string; a send/forward receipt's is an array — an immediate structural
+mismatch); (2) even a hypothetically shape-compatible payload fails signature verification, because
+each receipt type derives its HMAC signing key from the same underlying Keychain secret
+(`SEND_SIGNING_KEYCHAIN_SERVICE`) via its **own** domain-separated `SIGNING_KEY_INFO` string
+(`send-intent-receipt:signature:v1` / `reply-intent-receipt:signature:v1` /
+`forward-intent-receipt:signature:v1`) — a signature produced under one derived key never verifies
+under another; (3) the replay guard's nonces are prefixed per type (`reply:`/`forward:`, bare for
+send) at the call site, so even an id collision (astronomically unlikely given 128-bit random ids)
+could never let one type's consumption record satisfy another's. See
+`tests/security-reply-intent-receipt.test.ts` and `tests/security-forward-intent-receipt.test.ts`'s
+"cross-purpose receipt rejection" suites, and `tests/security-send-intent-replay-guard.test.ts`'s
+"purpose-prefixed nonces" suite.
+
+## Live reply/forward is disabled (0.5.2)
+
+Mirrors 0.4.0's `mail_delete_permanently` gate and 0.5.0's original `mail_send` gate: `LIVE_REPLY_
+DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) are unconditionally `true` — no config
+flag, no environment variable, a hardcoded constant a future task flips only after live-validating
+each path against the real Bridge, exactly as 0.5.1 did for `mail_send`. Preview and `dryRun: true`
+are unaffected and fully functional. One deliberate difference from `mail_send`'s replay-guard
+ordering: the feature-gate check runs **before** the replay guard consumes the receipt's one-time
+nonce (`src/smtp/reply-send.ts`/`forward-send.ts`), so a gate-blocked call — which causes no external
+side effect — never burns an otherwise-valid receipt. This is correct because "at most one attempt"
+is meant to bound real attempts, and a call that cannot possibly reach SMTP was never one; once the
+gate opens in a future version, the ordering downstream of it collapses to exactly `mail_send`'s
+existing at-most-once semantics (`tests/smtp-reply-send.test.ts`/`smtp-forward-send.test.ts`'s
+"feature gate ordering" suites test both the gate-closed-preserves-the-receipt case and the
+gate-open-still-enforces-at-most-once case via an injectable `deps.liveDisabled` test seam that
+production code never sets).
+
 ## Reporting
 
 This is a personal, local-only project whose only network-facing surface beyond `127.0.0.1` is a small,
 heavily-restricted set: the single outbound HTTPS request `mail_unsubscribe` may make (see "External HTTP
 side effect" above), and — as of 0.5.1 — the loopback-only, receipt-gated, at-most-once-per-attempt SMTP
-connection `mail_send` makes on a fully-confirmed live call (see "Live SMTP submission (0.5.1)"). If you
-fork or extend it and find a security issue, treat it with the same care as the points above:
-prefer removing a footgun over rationalizing it.
+connection `mail_send` makes on a fully-confirmed live call (see "Live SMTP submission (0.5.1)"). As of
+0.5.2, `mail_reply`/`mail_forward` share that same connection path, but live execution remains
+unconditionally feature-gated off pending separate validation (see "Live reply/forward is disabled"
+above). If you fork or extend it and find a security issue, treat it with the same care as the points
+above: prefer removing a footgun over rationalizing it.

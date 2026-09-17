@@ -5,6 +5,8 @@ import { registerArchiveTool } from '../src/tools/archive.js';
 import { registerCreateFolderTool } from '../src/tools/create-folder.js';
 import { registerCreateLabelTool } from '../src/tools/create-label.js';
 import { registerDeletePermanentlyTool } from '../src/tools/delete-permanently.js';
+import { registerForwardPreviewTool } from '../src/tools/forward-preview.js';
+import { registerForwardTool } from '../src/tools/forward.js';
 import { registerGetMessageTool } from '../src/tools/get-message.js';
 import { registerListFoldersTool } from '../src/tools/list-folders.js';
 import { registerListMessagesTool } from '../src/tools/list-messages.js';
@@ -13,6 +15,8 @@ import { registerMarkSpamTool } from '../src/tools/mark-spam.js';
 import { registerMarkUnreadTool } from '../src/tools/mark-unread.js';
 import { registerMoveTool } from '../src/tools/move.js';
 import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
+import { registerReplyPreviewTool } from '../src/tools/reply-preview.js';
+import { registerReplyTool } from '../src/tools/reply.js';
 import { registerRestoreFromTrashTool } from '../src/tools/restore-from-trash.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
 import { registerSendPreviewTool } from '../src/tools/send-preview.js';
@@ -21,6 +25,10 @@ import { registerTrashTool } from '../src/tools/trash.js';
 import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from '../src/tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from '../src/tools/unsubscribe.js';
+import { inputSchema as replyInputSchema } from '../src/tools/reply.js';
+import { inputSchema as replyPreviewInputSchema } from '../src/tools/reply-preview.js';
+import { inputSchema as forwardInputSchema } from '../src/tools/forward.js';
+import { inputSchema as forwardPreviewInputSchema } from '../src/tools/forward-preview.js';
 
 interface CapturedRegistration {
   name: string;
@@ -108,6 +116,25 @@ const EXPECTED_READ_ONLY_NAMES = [
 const smtpRegistrars = [registerSendPreviewTool, registerSendTool];
 const EXPECTED_SMTP_NAMES = ['mail_send', 'mail_send_preview'];
 
+// V5.2 (0.5.2, "Controlled Reply & Forward"): mail_reply_preview/
+// mail_forward_preview are read-only (zero SMTP connections); mail_reply/
+// mail_forward are not read-only but deliberately NOT destructiveHint —
+// same MCP-semantics reasoning as mail_send. Live submission is
+// unconditionally feature-gated off in 0.5.2 — see
+// src/smtp/reply-send.ts, forward-send.ts, feature-gates.ts.
+const replyForwardRegistrars = [
+  registerReplyPreviewTool,
+  registerReplyTool,
+  registerForwardPreviewTool,
+  registerForwardTool,
+];
+const EXPECTED_REPLY_FORWARD_NAMES = [
+  'mail_forward',
+  'mail_forward_preview',
+  'mail_reply',
+  'mail_reply_preview',
+];
+
 const EXPECTED_MUTATION_NAMES = [
   'mail_apply_label',
   'mail_archive',
@@ -135,12 +162,15 @@ const DESTRUCTIVE_HINT_EXPECTED = new Set(['mail_mark_spam', 'mail_unsubscribe']
 // for the same reason — mail_send / mail_send_preview now exist, but ONLY
 // through their own narrow, plain-text-only, receipt-gated, feature-gated
 // path — see the "V5 — SMTP Send Foundation" tests below, which pin down the
-// EXACT set of send-named tools allowed to exist. "expunge", a bare "smtp"
-// prefix, "reply", and "forward" stay banned outright: no tool in this
-// project is ever named after the raw IMAP command, a generic SMTP verb, or
-// reply/forward (0.5.1 scope, not built yet), ideally or in a gated form.
-const BANNED_NAME_PATTERN =
-  /^mail_(expunge|smtp|reply|forward|block[_-]?list|allow[_-]?list|draft.?send)/i;
+// EXACT set of send-named tools allowed to exist. "reply"/"forward" were
+// removed from this list in 0.5.2 for the same reason — mail_reply(_preview)
+// / mail_forward(_preview) now exist, but ONLY through their own narrow,
+// no-reply-all, receipt-gated, feature-gated path — see the "V5.2" tests
+// below, which pin down the EXACT set of reply/forward-named tools allowed
+// to exist. "expunge" and a bare "smtp" prefix stay banned outright: no tool
+// in this project is ever named after the raw IMAP command or a generic
+// SMTP verb, ideally or in a gated form.
+const BANNED_NAME_PATTERN = /^mail_(expunge|smtp|block[_-]?list|allow[_-]?list|draft.?send)/i;
 
 describe('V1 read-only tool registration', () => {
   it('registers exactly the five documented read-only tool names', () => {
@@ -240,6 +270,60 @@ describe('V5 — SMTP Send Foundation tool registration', () => {
   });
 });
 
+describe('V5.2 — Controlled Reply & Forward tool registration', () => {
+  it('registers exactly the four documented reply/forward tool names', () => {
+    const names = replyForwardRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    expect(names.sort()).toEqual(EXPECTED_REPLY_FORWARD_NAMES);
+  });
+
+  it('mail_reply_preview and mail_forward_preview are read-only and non-destructive', () => {
+    for (const register of [registerReplyPreviewTool, registerForwardPreviewTool]) {
+      const [registration] = captureRegistrations(register);
+      expect(registration?.config.annotations?.readOnlyHint).toBe(true);
+      expect(registration?.config.annotations?.destructiveHint).toBe(false);
+    }
+  });
+
+  it('mail_reply and mail_forward are NOT read-only but are deliberately NOT destructiveHint either', () => {
+    for (const register of [registerReplyTool, registerForwardTool]) {
+      const [registration] = captureRegistrations(register);
+      expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+      expect(registration?.config.annotations?.destructiveHint).toBe(false);
+    }
+  });
+
+  it('structural no-reply-all: mail_reply_preview/mail_reply schemas have no cc/bcc/custom-header fields', () => {
+    for (const schema of [replyPreviewInputSchema, replyInputSchema]) {
+      const shape = schema.shape as Record<string, unknown>;
+      expect(shape.cc).toBeUndefined();
+      expect(shape.bcc).toBeUndefined();
+      expect(shape.headers).toBeUndefined();
+      expect(shape.inReplyTo).toBeUndefined();
+      expect(shape.references).toBeUndefined();
+      expect(shape.from).toBeUndefined();
+    }
+  });
+
+  it('structural: mail_forward_preview/mail_forward schemas have no cc/bcc fields and never derive recipients from the source', () => {
+    for (const schema of [forwardPreviewInputSchema, forwardInputSchema]) {
+      const shape = schema.shape as Record<string, unknown>;
+      expect(shape.cc).toBeUndefined();
+      expect(shape.bcc).toBeUndefined();
+      expect(shape.from).toBeUndefined();
+      expect(shape.to).toBeDefined(); // caller-supplied recipients ARE required
+    }
+  });
+
+  it('mail_reply/mail_forward schemas have no caller-suppliable subject field (always derived)', () => {
+    for (const schema of [replyInputSchema, forwardInputSchema]) {
+      const shape = schema.shape as Record<string, unknown>;
+      expect(shape.subject).toBeUndefined();
+    }
+  });
+});
+
 describe('the full tool surface', () => {
   const allRegistrars = [
     ...readOnlyRegistrars,
@@ -247,14 +331,15 @@ describe('the full tool surface', () => {
     registerTriageIntelligenceTools,
     ...trashLifecycleRegistrars,
     ...smtpRegistrars,
+    ...replyForwardRegistrars,
   ];
 
-  it('is exactly 25 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3) + V5 (2)', () => {
+  it('is exactly 29 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3) + V5 (2) + V5.2 (4)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(25);
-    expect(new Set(names).size).toBe(25); // no accidental duplicate names
+    expect(names).toHaveLength(29);
+    expect(new Set(names).size).toBe(29); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {
@@ -264,13 +349,13 @@ describe('the full tool surface', () => {
     }
   });
 
-  it('has no bare-SMTP, reply, or forward tool registered anywhere (0.5.1 scope, not built yet)', () => {
+  it('has no bare-SMTP tool registered anywhere, and the only reply/forward tools are the four documented V5.2 ones', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    for (const forbidden of [/^mail_smtp/i, /^mail_reply/i, /^mail_forward/i]) {
-      expect(names.some((name) => forbidden.test(name))).toBe(false);
-    }
+    expect(names.some((name) => /^mail_smtp/i.test(name))).toBe(false);
+    const replyOrForwardNamed = names.filter((name) => /^mail_(reply|forward)/i.test(name));
+    expect(replyOrForwardNamed.sort()).toEqual(EXPECTED_REPLY_FORWARD_NAMES);
   });
 
   it('the only send-named tools are the two documented V5 tools', () => {

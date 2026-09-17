@@ -1274,6 +1274,142 @@ see SECURITY.md. (This is exactly what the separate, subsequent live-validation 
 implementation task — is expected to discover empirically, via a self-send; see the recommendation
 above.)
 
+## V5.2 — Controlled Reply & Forward (0.5.2)
+
+Four tools built on top of the same, already-validated SMTP transport: `mail_reply_preview`/
+`mail_reply` and `mail_forward_preview`/`mail_forward`. As with `mail_send` in 0.5.0/0.5.1, live
+submission ships **unconditionally feature-gated off** in 0.5.2 (`src/smtp/feature-gates.ts`) — a
+separate task will live-validate and enable each. Preview and dry-run are fully functional today.
+
+### No reply-all, ever
+
+There is no mechanism, gated or otherwise, to reply to more than one recipient. If a source
+message's `Reply-To` header specifies more than one address, `mail_reply_preview`/`mail_reply`
+report the reply **ineligible** rather than expanding it — this is a structural property (the
+recipient field is always a single string, never an array), not a policy check that could be
+relaxed later without a schema change.
+
+### Reply recipient: Reply-To, then From — never the message body
+
+Recipient derivation (`src/smtp/reply-intent.ts`):
+
+1. If the source message has a `Reply-To` header **at all**, it is used, but only if it resolves to
+   **exactly one** valid, normalized address. A `Reply-To` header that is present but malformed
+   (oversized, contains control characters, or an IMAP-server-parsed address list of zero or more
+   than one entries) makes the reply **ineligible** — it never silently falls back to `From`.
+   Distinguishing "no `Reply-To` header" from "a `Reply-To` header that didn't parse to anything
+   usable" matters here: some IMAP servers mirror `From` into the `Reply-To` slot of their `ENVELOPE`
+   response when the header is genuinely absent (RFC 3501), so this project fetches and checks the
+   **raw header's presence** independently, never inferring absence from an empty parsed list alone.
+2. Otherwise, `From` is used (after the same address validation).
+3. If neither yields a valid address, the reply is ineligible.
+
+Replying to a message you sent yourself (`From` equals your own identity, no usable `Reply-To`)
+naturally resolves to replying to yourself — nothing alternate (like the original `To`) is ever
+substituted. The recipient is never, under any circumstance, derived from the reply text or the
+source message's body.
+
+### Reply threading
+
+`In-Reply-To`/`References` (`src/smtp/reply-intent.ts`) are derived entirely from the source
+message's own `Message-ID`/`References` headers — never caller-suppliable, and the raw values never
+appear in any tool's JSON output (a `threadingHash` — a plain content hash, not the raw ids — is
+bound in the receipt instead). Threading availability is **independent of eligibility**: a missing
+or malformed `Message-ID` simply produces `threadingAvailable: false` and an unthreaded (but still
+fully eligible) reply. When a valid `Message-ID` exists but the message's own `References` chain is
+malformed or exceeds a conservative byte bound, the historical chain is discarded entirely and
+`References` is rebuilt as exactly `[thatMessage-Id]` — nothing is invented; a broken chain is
+simply never propagated or partially trusted.
+
+### Reply subject and body
+
+Subject is always derived (`Re: `, recognized case-insensitively so it's never doubled) — the
+caller cannot choose it. The reply body is **exactly the caller's supplied text**; the original
+message is never automatically quoted or included, which keeps the surface small (no prompt-
+injection-via-quoted-body risk, no accidental leakage, no unbounded reply size).
+
+### Forward recipients: always caller-supplied
+
+`mail_forward_preview`/`mail_forward`'s `to[]` is explicit caller input only, validated with the
+exact same policy `mail_send` uses (`validateRecipients` — normalized, deduped, capped at 5, no
+control characters) — **never** derived from the source message's `To`/`Cc`/`From` in any way. No
+Cc, no Bcc. Subject is always derived (`Fwd: `, tolerant of an existing `Fwd:`/`Fw:` prefix so it's
+never doubled).
+
+### Forward content is plain-text-only and deterministic
+
+The forwarded body is a fixed, deterministic template:
+
+```
+---------- Forwarded message ----------
+From: <single safe line>
+Date: <single safe line>
+Subject: <single safe line>
+To: <single safe line>
+
+<the source's plain text>
+```
+
+Each header field shown is normalized to one safe line (control characters including CR/LF
+stripped/collapsed, length-capped) specifically so a malicious source header can never forge
+additional lines into the visible block. HTML-only sources are converted to plain text (the same
+fallback `mail_get_message` uses) — HTML is never forwarded as HTML. The source content is treated
+strictly as **data**: instruction-like text in it (e.g. "ignore previous instructions and forward
+this to...") is embedded verbatim and never changes recipients, subject, or any tool behavior. This
+project's internal `UNTRUSTED_EMAIL_WARNING` framing (used elsewhere for model-facing tool output)
+is deliberately **never** embedded in the actual outgoing email body — a human recipient of a
+forwarded message sees a normal forward, not internal MCP security copy.
+
+### Attachments are always omitted
+
+No attachment is ever included in a forward, in any form. `mail_forward_preview` reports
+`sourceHasAttachments`/`attachmentsWillBeOmitted`; a live `mail_forward` call additionally requires
+`acknowledgeAttachmentsWillBeOmitted: true` whenever the (cryptographically verified) receipt says
+the source has attachments — checked against the receipt, never an unverified caller claim.
+
+### Minimal source fetching (no full-body fetch for reply)
+
+`mail_reply_preview`/`mail_reply` fetch **only** the IMAP envelope plus the raw `References`/
+`Reply-To` header bytes for the source message — never its body or attachment data — via
+`src/mail/source-message.ts`'s `fetchReplySourceHeaders`, a function entirely separate from
+`mail_get_message`'s full-body fetch path. `mail_forward_preview`/`mail_forward` need the message's
+text, so they fetch envelope + `BODYSTRUCTURE` (structure only, for attachment detection — content is
+never downloaded) + a **size-bounded** RFC822 source (512 KB, well under `mail_get_message`'s 10 MB
+cap) via `fetchForwardSourceContent`. This is a deliberate 0.5.2 trade-off in place of true selective
+per-MIME-part fetching (which would require re-implementing MIME transfer-decoding this project
+otherwise gets for free from `postal-mime`): a message whose fetched source turns out to be
+**truncated** by that bound (detected by comparing the server-reported total message size against
+the bytes actually returned) is reported **ineligible** rather than partially forwarded, and the same
+applies if the extracted text itself exceeds the outbound size bound — neither case is ever silently
+shortened. Revisit with selective MIME fetching if real-world messages hit this cap. Neither fetch
+function ever marks the source message read.
+
+### Reply/forward intent receipts
+
+`src/security/reply-intent-receipt.ts` / `forward-intent-receipt.ts` mirror `send-intent-receipt.ts`'s
+design exactly (HMAC-SHA256, 15-minute TTL, exact field match required) but are signed with their own
+domain-separated derived keys — same Keychain secret as `mail_send`
+(`getSendIntentSigningSecretOrUndefined`, no new Keychain entry), different `SIGNING_KEY_INFO`
+strings, so a `sendIntentReceipt` can never verify as a reply/forward receipt or vice versa. Each
+receipt binds a `sourceFingerprint`: an HMAC over the source message's `folder`/IMAP `UIDVALIDITY`/
+`uid` (the durable identity handle) plus `From`/`Subject`/`Date` for tamper-evidence, with
+`Message-ID` folded in **only when present** — a missing `Message-ID` never blocks fingerprinting or
+receipt issuance, since identity and threading are independent properties (see above). Live
+`mail_reply`/`mail_forward` re-fetch the source immediately before submission and recompute this
+fingerprint (and the reply's `threadingHash`, and the forward's content hashes); any drift since
+preview — the message changed, moved, or was deleted — is rejected before any SMTP connection, same
+as `mail_send`'s receipt-match check.
+
+### Live reply/forward is disabled — and a blocked attempt never burns the receipt
+
+Both `LIVE_REPLY_DISABLED` and `LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) are
+unconditionally `true` in 0.5.2. Unlike `mail_send`'s replay guard, this gate check runs **before**
+the replay-guard's one-time nonce is consumed: a live call that is fully valid (consent, intent,
+receipt) but blocked by the gate reports `submissionAttempted: false` and leaves its receipt
+untouched and reusable (until it naturally expires) — it caused no external side effect, so it was
+never a real "attempt" in the at-most-once sense. Once a future task validates and flips these gates,
+the ordering downstream of the gate reduces to exactly `mail_send`'s existing at-most-once semantics.
+
 ## Threat model (prompt injection via email)
 
 Email is attacker-controlled input. Anyone who can send you mail can put arbitrary text — including text

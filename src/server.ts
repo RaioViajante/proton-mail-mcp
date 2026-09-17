@@ -5,6 +5,8 @@ import { registerArchiveTool } from './tools/archive.js';
 import { registerCreateFolderTool } from './tools/create-folder.js';
 import { registerCreateLabelTool } from './tools/create-label.js';
 import { registerDeletePermanentlyTool } from './tools/delete-permanently.js';
+import { registerForwardPreviewTool } from './tools/forward-preview.js';
+import { registerForwardTool } from './tools/forward.js';
 import { registerGetMessageTool } from './tools/get-message.js';
 import { registerListFoldersTool } from './tools/list-folders.js';
 import { registerListMessagesTool } from './tools/list-messages.js';
@@ -13,6 +15,8 @@ import { registerMarkSpamTool } from './tools/mark-spam.js';
 import { registerMarkUnreadTool } from './tools/mark-unread.js';
 import { registerMoveTool } from './tools/move.js';
 import { registerRemoveLabelTool } from './tools/remove-label.js';
+import { registerReplyPreviewTool } from './tools/reply-preview.js';
+import { registerReplyTool } from './tools/reply.js';
 import { registerRestoreFromTrashTool } from './tools/restore-from-trash.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
 import { registerSendPreviewTool } from './tools/send-preview.js';
@@ -23,7 +27,7 @@ import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.5.1';
+const SERVER_VERSION = '0.5.2';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -83,8 +87,8 @@ const SERVER_VERSION = '0.5.1';
  * had — see src/smtp/ and SECURITY.md ("No SMTP, ever" is retired; see "SMTP
  * host is loopback-only" instead). Scope is deliberately minimal: plain-text
  * only (no HTML/attachments/inline images/raw MIME/custom headers), no
- * reply/forward (0.5.1), no Bcc, From locked to the configured Bridge
- * account identity, recipients capped at 5 total. The SMTP host is
+ * reply/forward (added in 0.5.2 — see below), no Bcc, From locked to the
+ * configured Bridge account identity, recipients capped at 5 total. The SMTP host is
  * validated loopback-only (127.0.0.0/8, ::1, or "localhost" re-resolved and
  * re-checked) — this project is a Bridge-only SMTP client, never a
  * general-purpose one. mail_send_preview issues a signed sendIntentReceipt
@@ -103,7 +107,41 @@ const SERVER_VERSION = '0.5.1';
  * guard.ts). This makes each sendIntentReceipt single-use per submission
  * *attempt*, not per success — a caller must call mail_send_preview again
  * for any retry, on any outcome. See src/smtp/send.ts and SECURITY.md
- * ("Live SMTP submission (0.5.1)", "Send-intent receipt replay").
+ * ("Live SMTP submission (0.5.1)", "Send-intent receipt replay"). 0.5.1 was
+ * live-validated against the real Bridge in a separate task: exactly one
+ * SMTP submission, accepted, self-send observed in Inbox and Sent, receipt
+ * nonce correctly consumed.
+ * V5.2 (0.5.2, "Controlled Reply & Forward") adds mail_reply_preview/
+ * mail_reply and mail_forward_preview/mail_forward on top of the same,
+ * already-validated SMTP transport — reply-all is never implemented (a
+ * Reply-To with more than one address, or one that's malformed/oversized,
+ * fails closed rather than degrading to it); reply recipient is Reply-To
+ * then From (never the message body); reply threading (In-Reply-To/
+ * References) is derived from the source's own Message-ID/References when
+ * valid, never caller-suppliable, and a missing/malformed Message-ID simply
+ * yields an unthreaded (still eligible) reply; forward recipients are
+ * always caller-supplied, never derived from the source; forward content is
+ * plain-text-only and deterministic, with attachments always omitted
+ * (mail_forward_preview reports sourceHasAttachments; a live forward
+ * additionally requires acknowledgeAttachmentsWillBeOmitted when true).
+ * Both preview tools fetch only the minimal source data each needs (reply:
+ * headers only, no body; forward: a conservatively size-bounded source,
+ * never partially forwarded — see src/mail/source-message.ts) and never
+ * mark the source message read. Both use their own signed
+ * replyIntentReceipt/forwardIntentReceipt (src/security/reply-intent-
+ * receipt.ts, forward-intent-receipt.ts) — same Keychain secret as
+ * mail_send, purpose-separated HMAC domains so no receipt type can verify
+ * as another — and the same replay guard as mail_send, with nonces
+ * namespaced by a `reply:`/`forward:` prefix at the call site (the guard
+ * module itself is unmodified). LIVE REPLY AND LIVE FORWARD ARE BOTH
+ * UNCONDITIONALLY FEATURE-GATED OFF IN 0.5.2 (src/smtp/feature-gates.ts) —
+ * preview and dryRun=true work fully; a fully-valid dryRun=false call is
+ * refused before any credential is requested and, notably, does NOT consume
+ * its receipt (checked before the replay guard, unlike mail_send — a
+ * gate-blocked call caused no external side effect, so it was never a real
+ * "attempt"). A separate task will live-validate and enable each, exactly
+ * as 0.5.1 did for mail_send. See src/smtp/reply-send.ts, forward-send.ts,
+ * and SECURITY.md.
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -139,6 +177,11 @@ export function createServer(): McpServer {
 
   registerSendPreviewTool(server);
   registerSendTool(server);
+
+  registerReplyPreviewTool(server);
+  registerReplyTool(server);
+  registerForwardPreviewTool(server);
+  registerForwardTool(server);
 
   return server;
 }

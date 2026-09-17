@@ -75,14 +75,15 @@ function attachmentSizeBytes(content: ArrayBuffer | Uint8Array | string): number
   return null;
 }
 
-function nodeHasOwnAttachment(node: MessageStructureObject): boolean {
+/** Exported for reuse by `src/mail/source-message.ts` (forward's attachment detection) — this walker never reads attachment content, only `bodyStructure` metadata. */
+export function nodeHasOwnAttachment(node: MessageStructureObject): boolean {
   if (node.disposition === 'attachment') return true;
   if (node.type.startsWith('multipart/')) return false;
   const filename = node.dispositionParameters?.filename ?? node.parameters?.name;
   return Boolean(filename) && node.disposition !== 'inline';
 }
 
-function hasAttachments(node: MessageStructureObject | undefined): boolean {
+export function hasAttachments(node: MessageStructureObject | undefined): boolean {
   if (!node) return false;
   if (nodeHasOwnAttachment(node)) return true;
   return (node.childNodes ?? []).some(hasAttachments);

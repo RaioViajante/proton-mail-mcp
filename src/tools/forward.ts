@@ -75,10 +75,9 @@ export function registerForwardTool(server: McpServer): void {
         'mail_forward_preview call, AND acknowledgeAttachmentsWillBeOmitted=true whenever that ' +
         '(verified) receipt reports the source has attachments — and immediately re-fetches and ' +
         're-validates the source message before submitting; any drift since preview (including its ' +
-        'text or attachment presence) is rejected before any SMTP connection. LIVE FORWARD IS ' +
-        'UNCONDITIONALLY DISABLED IN THIS VERSION (0.5.2): a fully-confirmed, fully-valid ' +
-        'dryRun=false call is still refused before any credential is requested, and does NOT ' +
-        'consume the receipt. mail_forward_preview and dryRun=true both work fully today. No Cc, ' +
+        'text or attachment presence) is rejected before any SMTP connection. Controlled live ' +
+        'forward is enabled in 0.5.4; real Bridge validation remains pending after a full MCP ' +
+        'process restart. No Cc, ' +
         'no Bcc, no HTML forwarding, no attachments, no custom headers; From is restricted to the ' +
         'configured Bridge account identity.',
       inputSchema,

@@ -124,8 +124,7 @@ function computeFingerprint(
  * validation -> attachment-acknowledgement check (against the VERIFIED
  * receipt's `sourceHasAttachments`, never a caller claim) -> feature gate ->
  * replay-guard nonce consumption -> credential -> SMTP. The feature gate
- * runs BEFORE nonce consumption so a gate-blocked call (always true in this
- * version) never burns the receipt.
+ * runs BEFORE nonce consumption so a gate-blocked call never burns the receipt.
  */
 export async function sendForward(
   source: ForwardSourceContent | null,
@@ -228,9 +227,8 @@ export async function sendForward(
   if (liveDisabled) {
     return preSubmissionRejection(base, true, [
       ...validation.reasons,
-      'Live mail_forward is disabled in this version (0.5.2); forward preview and dry-run remain ' +
-        'available, and this receipt was NOT consumed and remains usable (until it expires). A ' +
-        'separate task will validate and enable live forward.',
+      'Live mail_forward is disabled by the feature gate; forward preview and dry-run remain ' +
+        'available, and this receipt was NOT consumed and remains usable (until it expires).',
     ]);
   }
 

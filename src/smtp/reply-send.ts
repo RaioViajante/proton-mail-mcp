@@ -139,7 +139,7 @@ function computeIdentity(
  * runs BEFORE nonce consumption specifically so a gate-blocked call never
  * burns an otherwise-valid receipt — it caused no external side effect, so
  * it was never a real "attempt". The live reply gate is open in 0.5.3;
- * live forward remains gated off.
+ * the live forward gate is open in 0.5.4.
  */
 export async function sendReply(
   source: ReplySourceHeaders | null,

@@ -33,8 +33,7 @@ export function registerReplyPreviewTool(server: McpServer): void {
         'derive a recipient/subject/threading plan — never the source message body or ' +
         'attachments. Makes ZERO SMTP connections. Issues a signed, opaque replyIntentReceipt when ' +
         'eligible and a send-signing secret is provisioned — pass it back to mail_reply unmodified. ' +
-        'Live reply is unconditionally disabled in this version pending separate validation; see ' +
-        'mail_reply.',
+        'Controlled live reply was enabled and separately validated in 0.5.3; see mail_reply.',
       inputSchema,
       annotations: {
         readOnlyHint: true,

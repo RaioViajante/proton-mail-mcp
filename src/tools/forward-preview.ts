@@ -43,8 +43,8 @@ export function registerForwardPreviewTool(server: McpServer): void {
         'all, or whose text exceeds the outbound bound, is reported ineligible rather than ' +
         'partially or silently-shortened forwarded (see sourceContentComplete). Makes ZERO SMTP ' +
         'connections. Issues a signed, opaque forwardIntentReceipt when eligible and a ' +
-        'send-signing secret is provisioned. Live forward is unconditionally disabled in this ' +
-        'version pending separate validation; see mail_forward.',
+        'send-signing secret is provisioned. Controlled live forward is enabled in 0.5.4; ' +
+        'real Bridge validation remains pending after a full MCP restart; see mail_forward.',
       inputSchema,
       annotations: {
         readOnlyHint: true,

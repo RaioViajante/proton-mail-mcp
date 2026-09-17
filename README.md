@@ -1279,8 +1279,9 @@ above.)
 Four tools built on top of the same, already-validated SMTP transport: `mail_reply_preview`/
 `mail_reply` and `mail_forward_preview`/`mail_forward`. As with `mail_send` in 0.5.0/0.5.1, live
 submission shipped **unconditionally feature-gated off** in 0.5.2 (`src/smtp/feature-gates.ts`).
-0.5.3 enables controlled live reply; live forward remains disabled. Preview and dry-run remain fully
-functional.
+0.5.3 enabled and subsequently live-validated controlled reply. 0.5.4 enables controlled live
+forward in code; real Bridge validation remains pending until a full MCP process restart. Preview
+and dry-run remain fully functional.
 
 ### No reply-all, ever
 
@@ -1401,20 +1402,16 @@ fingerprint (and the reply's `threadingHash`, and the forward's content hashes);
 preview — the message changed, moved, or was deleted — is rejected before any SMTP connection, same
 as `mail_send`'s receipt-match check.
 
-### Live forward is disabled; live reply is enabled as of 0.5.3
+### Controlled live forward is enabled as of 0.5.4
 
 `LIVE_REPLY_DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) both started 0.5.2
-unconditionally `true`. **0.5.3 ("Controlled Live Reply") flips `LIVE_REPLY_DISABLED` to `false`**,
-enabling controlled live reply in code. Real Bridge validation is still pending and is performed
-separately after a full MCP process restart. No real reply was sent as part of this implementation.
-`LIVE_FORWARD_DISABLED` stays `true`, unchanged — forward remains preview/dry-run-only pending its
-own separate live-validation task. No 0.5.2 protection was relaxed to lift the reply gate: consent
-gate, full receipt verification, source revalidation immediately before submission, and the replay
-guard are all unchanged. One ordering detail that still matters for `mail_forward` (and remains true
-in code for `mail_reply`): the feature-gate check runs **before** the replay-guard's one-time nonce
-is consumed, so a gate-blocked call reports `submissionAttempted: false` and leaves its receipt
-untouched and reusable — it caused no external side effect, so it was never a real "attempt" in the
-at-most-once sense.
+unconditionally `true`. 0.5.3 flipped only `LIVE_REPLY_DISABLED` to `false`; its separate real
+Bridge validation succeeded. **0.5.4 flips only `LIVE_FORWARD_DISABLED` to `false`.** Real forward
+validation is still pending and must follow a full MCP process restart. No real forward is sent by
+the 0.5.4 implementation task. Consent, full receipt verification, source revalidation immediately
+before submission, attachment-omission acknowledgement, and nonce consumption before SMTP remain
+in force. The feature-gate check still precedes nonce consumption: a gate-blocked call leaves the
+receipt usable because no external attempt occurred.
 
 ## Threat model (prompt injection via email)
 

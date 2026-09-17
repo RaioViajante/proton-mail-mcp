@@ -189,7 +189,7 @@ describe('mail_forward (tool-level, 0.5.2)', () => {
     expect(parsed.submissionAttempted).toBeUndefined();
   });
 
-  it('live forward is unconditionally blocked even with full consent + a valid receipt', async () => {
+  it('0.5.4: live forward passes the gate and reaches the credential step', async () => {
     wireBridge(
       createFakeImapClient({ mailbox: { exists: 1 }, fetchResults: [fakeForwardMessage()] }),
     );
@@ -212,9 +212,10 @@ describe('mail_forward (tool-level, 0.5.2)', () => {
       acknowledgeAttachmentsWillBeOmitted: false,
     });
     const parsed = parseSend(liveResult);
-    expect(parsed.outcome).toBe('rejected');
-    expect(parsed.submissionAttempted).toBe(false);
-    expect(bridgeConfig.getBridgePassword).not.toHaveBeenCalled();
+    expect(parsed.reasons.join(' ')).not.toMatch(/disabled/i);
+    expect(bridgeConfig.getBridgePassword).toHaveBeenCalledTimes(1);
+    expect(parsed.outcome).toBe('failed');
+    expect(parsed.connectionEstablished).toBe(false);
   });
 });
 

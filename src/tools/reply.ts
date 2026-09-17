@@ -62,7 +62,7 @@ export function registerReplyTool(server: McpServer): void {
         'a prior mail_reply_preview call, AND immediately re-fetches and re-validates the source ' +
         'message identity/Reply-To/threading before submitting — any drift since preview is ' +
         'rejected before any SMTP connection. Controlled live reply is enabled in 0.5.3; real ' +
-        'Bridge validation is still pending after a full MCP process restart. mail_reply_preview ' +
+        'Bridge validation succeeded after a full MCP process restart. mail_reply_preview ' +
         'and dryRun=true both work fully. No Cc, no ' +
         'reply-all, no HTML/attachments, no custom headers; From is restricted to the configured ' +
         'Bridge account identity.',

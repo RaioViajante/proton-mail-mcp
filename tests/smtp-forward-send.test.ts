@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ForwardSourceContent } from '../src/mail/source-message.js';
 import { resetReplayGuardForTests } from '../src/security/send-intent-replay-guard.js';
+import { FORWARD_INTENT_RECEIPT_TTL_MS } from '../src/security/forward-intent-receipt.js';
 import type { ResolvedSmtpConfig } from '../src/smtp/config.js';
 import { previewForward } from '../src/smtp/forward-preview.js';
 import { sendForward } from '../src/smtp/forward-send.js';
@@ -28,7 +29,7 @@ function source(overrides: Partial<ForwardSourceContent> = {}): ForwardSourceCon
   };
 }
 
-describe('sendForward (0.5.2)', () => {
+describe('sendForward (0.5.4)', () => {
   let dir: string;
   let smtpConfig: ResolvedSmtpConfig;
   let getPassword: () => Promise<string>;
@@ -53,6 +54,7 @@ describe('sendForward (0.5.2)', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -81,6 +83,26 @@ describe('sendForward (0.5.2)', () => {
         ),
       ).rejects.toThrow(/confirm=true and acknowledgeExternalForward=true/);
       expect(sendFn).not.toHaveBeenCalled();
+    });
+
+    it('live missing acknowledgeExternalForward: throws before SMTP', async () => {
+      const sendFn = vi.fn();
+      await expect(
+        sendForward(
+          source(),
+          {
+            ...basePayload,
+            forwardIntentReceipt: previewReceipt(),
+            ...liveParams,
+            acknowledgeExternalForward: false,
+          },
+          smtpConfig,
+          SECRET,
+          { getPassword, sendFn },
+        ),
+      ).rejects.toThrow(/acknowledgeExternalForward=true/);
+      expect(sendFn).not.toHaveBeenCalled();
+      expect(getPassword).not.toHaveBeenCalled();
     });
   });
 
@@ -129,7 +151,7 @@ describe('sendForward (0.5.2)', () => {
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn },
       );
       expect(liveResult.outcome).toBe('accepted');
     });
@@ -245,6 +267,46 @@ describe('sendForward (0.5.2)', () => {
   });
 
   describe('source revalidation (section 20)', () => {
+    it.each([
+      ['UIDVALIDITY', { uidValidity: 'changed' }],
+      ['sender', { from: 'different@example.com' }],
+      ['subject', { subject: 'Changed' }],
+      ['attachment state', { hasAttachments: true }],
+    ])('%s drift since preview: zero SMTP', async (_name, change) => {
+      const receipt = previewReceipt();
+      const sendFn = vi.fn();
+      const result = await sendForward(
+        source(change),
+        { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(result.outcome).toBe('rejected');
+      expect(result.submissionAttempted).toBe(false);
+      expect(sendFn).not.toHaveBeenCalled();
+      expect(getPassword).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['recipient', { to: ['changed@example.com'] }],
+      ['intro text', { text: 'Changed intro' }],
+    ])('%s change since preview: zero SMTP', async (_name, change) => {
+      const receipt = previewReceipt();
+      const sendFn = vi.fn();
+      const result = await sendForward(
+        source(),
+        { ...basePayload, ...change, forwardIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(result.outcome).toBe('rejected');
+      expect(result.submissionAttempted).toBe(false);
+      expect(sendFn).not.toHaveBeenCalled();
+      expect(getPassword).not.toHaveBeenCalled();
+    });
+
     it('forwarded content changed since preview: rejected before SMTP', async () => {
       const receipt = previewReceipt(source({ plainText: 'Original message body.' }));
       const sendFn = vi.fn();
@@ -275,7 +337,7 @@ describe('sendForward (0.5.2)', () => {
   });
 
   describe('feature gate ordering (gate BEFORE nonce consumption)', () => {
-    it('gate closed (default): rejected, submissionAttempted false, nonce NOT consumed', async () => {
+    it('gate closed by test override: rejected, submissionAttempted false, nonce NOT consumed', async () => {
       const receipt = previewReceipt();
       const sendFn = vi.fn();
       const blocked = await sendForward(
@@ -283,7 +345,7 @@ describe('sendForward (0.5.2)', () => {
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn },
+        { getPassword, sendFn, liveDisabled: true },
       );
       expect(blocked.outcome).toBe('rejected');
       expect(blocked.submissionAttempted).toBe(false);
@@ -296,12 +358,12 @@ describe('sendForward (0.5.2)', () => {
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn },
       );
       expect(opened.outcome).toBe('accepted');
     });
 
-    it('gate open: nonce IS consumed on the first call; second call refused', async () => {
+    it('default gate open: nonce is consumed before SMTP and a second call is refused', async () => {
       const receipt = previewReceipt();
       const sendFn = vi
         .fn()
@@ -311,7 +373,7 @@ describe('sendForward (0.5.2)', () => {
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn },
       );
       expect(first.outcome).toBe('accepted');
 
@@ -320,11 +382,12 @@ describe('sendForward (0.5.2)', () => {
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn },
       );
       expect(second.outcome).toBe('rejected');
       expect(second.reasons.join(' ')).toMatch(/already been used/i);
       expect(sendFn).toHaveBeenCalledTimes(1);
+      expect(getPassword).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -348,6 +411,9 @@ describe('sendForward (0.5.2)', () => {
       expect(message.to).toEqual(['a@example.com']);
       expect(message.subject).toBe('Fwd: Hello');
       expect(message.text).toContain('Original message body.');
+      expect(message).toHaveProperty('cc', []);
+      expect(message).not.toHaveProperty('bcc');
+      expect(message).not.toHaveProperty('replyAll');
     });
   });
 
@@ -370,24 +436,57 @@ describe('sendForward (0.5.2)', () => {
       expect(result.outcome).toBe('rejected');
       expect(sendFn).not.toHaveBeenCalled();
     });
-  });
 
-  describe('0.5.3 regression: forward gate is unaffected by the reply gate being enabled', () => {
-    it('with no override, a fully valid live forward call is still rejected by the real (still-true) LIVE_FORWARD_DISABLED gate', async () => {
+    it('expired receipt: zero SMTP', async () => {
       const receipt = previewReceipt();
+      const now = Date.now();
+      vi.spyOn(Date, 'now').mockReturnValue(now + FORWARD_INTENT_RECEIPT_TTL_MS + 1);
       const sendFn = vi.fn();
       const result = await sendForward(
         source(),
         { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn }, // no liveDisabled override — the real gate
+        { getPassword, sendFn },
       );
       expect(result.outcome).toBe('rejected');
-      expect(result.submissionAttempted).toBe(false);
+      expect(result.reasons.join(' ')).toMatch(/expired/i);
       expect(sendFn).not.toHaveBeenCalled();
       expect(getPassword).not.toHaveBeenCalled();
-      expect(result.reasons.join(' ')).toMatch(/disabled/i);
+    });
+  });
+
+  it('SMTP failure does not retry automatically', async () => {
+    const receipt = previewReceipt();
+    const sendFn = vi.fn().mockRejectedValue(new Error('SMTP unavailable'));
+    const result = await sendForward(
+      source(),
+      { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
+      smtpConfig,
+      SECRET,
+      { getPassword, sendFn },
+    );
+    expect(result.outcome).not.toBe('accepted');
+    expect(sendFn).toHaveBeenCalledTimes(1);
+  });
+
+  describe('0.5.4 default gate', () => {
+    it('with no override, a fully valid live forward reaches SMTP exactly once', async () => {
+      const receipt = previewReceipt();
+      const sendFn = vi
+        .fn()
+        .mockResolvedValue({ accepted: ['a@example.com'], rejected: [], response: '250 OK' });
+      const result = await sendForward(
+        source(),
+        { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(result.outcome).toBe('accepted');
+      expect(result.submissionAttempted).toBe(true);
+      expect(sendFn).toHaveBeenCalledTimes(1);
+      expect(getPassword).toHaveBeenCalledTimes(1);
     });
   });
 });

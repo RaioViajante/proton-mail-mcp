@@ -29,8 +29,7 @@ export interface ReplySendDeps {
   /**
    * Test-only override of {@link LIVE_REPLY_DISABLED}. Production callers
    * (`src/tools/reply.ts`) never set this — it exists purely so the
-   * post-gate nonce-consumption-and-submission path is unit-testable now,
-   * without flipping the real feature-gate constant. Defaults to the real
+   * gate-closed and post-gate paths are unit-testable. Defaults to the real
    * gate.
    */
   liveDisabled?: boolean;
@@ -134,14 +133,13 @@ function computeIdentity(
  * `threadingHash`/recipient/subject won't match the receipt, and
  * `validateReplyIntentReceipt` rejects before any credential is requested.
  *
- * Gate/replay ordering (0.5.2, corrected from `mail_send`'s ordering):
+ * Gate/replay ordering (unchanged in 0.5.3):
  * consent gate -> intent validation -> receipt validation -> **feature gate**
  * -> replay-guard nonce consumption -> credential -> SMTP. The feature gate
- * runs BEFORE nonce consumption specifically so a gate-blocked call (always
- * true in this version) never burns an otherwise-valid receipt — it caused
- * no external side effect, so it was never a real "attempt". Once live ships
- * in a future task, the ordering downstream of the gate reduces to exactly
- * `mail_send`'s at-most-once semantics.
+ * runs BEFORE nonce consumption specifically so a gate-blocked call never
+ * burns an otherwise-valid receipt — it caused no external side effect, so
+ * it was never a real "attempt". The live reply gate is open in 0.5.3;
+ * live forward remains gated off.
  */
 export async function sendReply(
   source: ReplySourceHeaders | null,
@@ -235,9 +233,8 @@ export async function sendReply(
   if (liveDisabled) {
     return preSubmissionRejection(base, true, [
       ...validation.reasons,
-      'Live mail_reply is disabled in this version (0.5.2); reply preview and dry-run remain ' +
-        'available, and this receipt was NOT consumed and remains usable (until it expires). A ' +
-        'separate task will validate and enable live reply.',
+      'Live mail_reply is disabled by the feature gate; reply preview and dry-run remain ' +
+        'available, and this receipt was NOT consumed and remains usable (until it expires).',
     ]);
   }
 

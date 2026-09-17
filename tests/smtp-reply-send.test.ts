@@ -26,7 +26,7 @@ function source(overrides: Partial<ReplySourceHeaders> = {}): ReplySourceHeaders
   };
 }
 
-describe('sendReply (0.5.2)', () => {
+describe('sendReply (0.5.3)', () => {
   let dir: string;
   let smtpConfig: ResolvedSmtpConfig;
   let getPassword: () => Promise<string>;
@@ -81,6 +81,27 @@ describe('sendReply (0.5.2)', () => {
       ).rejects.toThrow(/confirm=true and acknowledgeExternalReply=true/);
       expect(sendFn).not.toHaveBeenCalled();
     });
+
+    it('live missing acknowledgeExternalReply: throws, zero send (0.5.3 — the gate being open does not relax this)', async () => {
+      const sendFn = vi.fn();
+      await expect(
+        sendReply(
+          source(),
+          {
+            ...basePayload,
+            replyIntentReceipt: previewReceipt(),
+            dryRun: false,
+            confirm: true,
+            acknowledgeExternalReply: false,
+          },
+          smtpConfig,
+          SECRET,
+          { getPassword, sendFn },
+        ),
+      ).rejects.toThrow(/confirm=true and acknowledgeExternalReply=true/);
+      expect(sendFn).not.toHaveBeenCalled();
+      expect(getPassword).not.toHaveBeenCalled();
+    });
   });
 
   describe('dry-run: zero SMTP, ever', () => {
@@ -114,8 +135,8 @@ describe('sendReply (0.5.2)', () => {
       );
       expect(dryRunResult.receiptValid).toBe(true);
 
-      // The same receipt must still work afterwards (with the live gate
-      // overridden open) — the dry-run check must not have burned the nonce.
+      // The same receipt must still work afterwards — the dry-run check
+      // must not have burned the nonce.
       const sendFn = vi
         .fn()
         .mockResolvedValue({ accepted: ['sender@example.com'], rejected: [], response: '250 OK' });
@@ -124,7 +145,7 @@ describe('sendReply (0.5.2)', () => {
         { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn },
       );
       expect(liveResult.outcome).toBe('accepted');
     });
@@ -179,6 +200,50 @@ describe('sendReply (0.5.2)', () => {
       );
       expect(result.outcome).toBe('rejected');
       expect(sendFn).not.toHaveBeenCalled();
+    });
+
+    it('receipt with a tampered signature: rejected before credential or SMTP', async () => {
+      const receipt = previewReceipt()!;
+      const sendFn = vi.fn();
+      const result = await sendReply(
+        source(),
+        {
+          ...basePayload,
+          replyIntentReceipt: { ...receipt, signature: '0'.repeat(64) },
+          ...liveParams,
+        },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(result.outcome).toBe('rejected');
+      expect(result.submissionAttempted).toBe(false);
+      expect(getPassword).not.toHaveBeenCalled();
+      expect(sendFn).not.toHaveBeenCalled();
+    });
+
+    it('expired receipt: rejected before credential or SMTP', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+        const receipt = previewReceipt();
+        vi.setSystemTime(new Date('2026-01-01T00:16:00.000Z'));
+        const sendFn = vi.fn();
+        const result = await sendReply(
+          source(),
+          { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
+          smtpConfig,
+          SECRET,
+          { getPassword, sendFn },
+        );
+        expect(result.outcome).toBe('rejected');
+        expect(result.submissionAttempted).toBe(false);
+        expect(result.reasons.join(' ')).toMatch(/expired/i);
+        expect(getPassword).not.toHaveBeenCalled();
+        expect(sendFn).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -240,8 +305,52 @@ describe('sendReply (0.5.2)', () => {
     });
   });
 
-  describe('feature gate ordering (corrected 0.5.2 semantics — gate BEFORE nonce consumption)', () => {
-    it('gate closed (default): live call is rejected, submissionAttempted false, and the receipt is NOT consumed', async () => {
+  describe('feature gate ordering (0.5.3 — LIVE_REPLY_DISABLED is now false by default)', () => {
+    it('the real (unset) gate now defaults to ENABLED: a fully valid live call reaches SMTP exactly once with no override needed', async () => {
+      const receipt = previewReceipt();
+      const sendFn = vi
+        .fn()
+        .mockResolvedValue({ accepted: ['sender@example.com'], rejected: [], response: '250 OK' });
+      const result = await sendReply(
+        source(),
+        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn }, // no liveDisabled override — this is the real, 0.5.3 default gate
+      );
+      expect(result.outcome).toBe('accepted');
+      expect(result.submissionAttempted).toBe(true);
+      expect(sendFn).toHaveBeenCalledTimes(1);
+      expect(getPassword).toHaveBeenCalledTimes(1);
+    });
+
+    it('nonce consumed exactly once: a second call with the same receipt is refused, zero further SMTP attempt', async () => {
+      const receipt = previewReceipt();
+      const sendFn = vi
+        .fn()
+        .mockResolvedValue({ accepted: ['sender@example.com'], rejected: [], response: '250 OK' });
+      const first = await sendReply(
+        source(),
+        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(first.outcome).toBe('accepted');
+
+      const second = await sendReply(
+        source(),
+        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(second.outcome).toBe('rejected');
+      expect(second.reasons.join(' ')).toMatch(/already been used/i);
+      expect(sendFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('regression: the gate-closed code path (deps.liveDisabled: true) still rejects before nonce consumption and still preserves the receipt — this is what mail_forward relies on today', async () => {
       const receipt = previewReceipt();
       const sendFn = vi.fn();
       const blocked = await sendReply(
@@ -249,7 +358,7 @@ describe('sendReply (0.5.2)', () => {
         { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn }, // no liveDisabled override — uses the real (true) gate
+        { getPassword, sendFn, liveDisabled: true },
       );
       expect(blocked.outcome).toBe('rejected');
       expect(blocked.submissionAttempted).toBe(false);
@@ -257,8 +366,8 @@ describe('sendReply (0.5.2)', () => {
       expect(getPassword).not.toHaveBeenCalled();
       expect(blocked.reasons.join(' ')).toMatch(/disabled/i);
 
-      // The SAME receipt must still be usable — a gate-blocked call must not
-      // burn the one-time nonce, since it caused no external side effect.
+      // The SAME receipt must still be usable afterwards — a gate-blocked
+      // call must not burn the one-time nonce.
       sendFn.mockResolvedValue({
         accepted: ['sender@example.com'],
         rejected: [],
@@ -269,54 +378,14 @@ describe('sendReply (0.5.2)', () => {
         { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
         smtpConfig,
         SECRET,
-        { getPassword, sendFn, liveDisabled: false },
+        { getPassword, sendFn }, // real (now-open) gate
       );
       expect(opened.outcome).toBe('accepted');
       expect(sendFn).toHaveBeenCalledTimes(1);
     });
-
-    it('gate open (test override): nonce IS consumed on the first call; a second call with the same receipt is refused regardless of gate state', async () => {
-      const receipt = previewReceipt();
-      const sendFn = vi
-        .fn()
-        .mockResolvedValue({ accepted: ['sender@example.com'], rejected: [], response: '250 OK' });
-      const first = await sendReply(
-        source(),
-        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
-        smtpConfig,
-        SECRET,
-        { getPassword, sendFn, liveDisabled: false },
-      );
-      expect(first.outcome).toBe('accepted');
-
-      const second = await sendReply(
-        source(),
-        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
-        smtpConfig,
-        SECRET,
-        { getPassword, sendFn, liveDisabled: false },
-      );
-      expect(second.outcome).toBe('rejected');
-      expect(second.reasons.join(' ')).toMatch(/already been used/i);
-      expect(sendFn).toHaveBeenCalledTimes(1);
-    });
-
-    it('the real (unset) gate defaults to disabled — no override needed to observe the block', async () => {
-      const receipt = previewReceipt();
-      const sendFn = vi.fn();
-      const result = await sendReply(
-        source(),
-        { ...basePayload, replyIntentReceipt: receipt, ...liveParams },
-        smtpConfig,
-        SECRET,
-        { getPassword, sendFn },
-      );
-      expect(result.outcome).toBe('rejected');
-      expect(sendFn).not.toHaveBeenCalled();
-    });
   });
 
-  describe('threading actually reaches the SMTP message (gate opened for this test only)', () => {
+  describe('threading actually reaches the SMTP message', () => {
     it('a threaded reply sets inReplyTo/references on the submitted message', async () => {
       const receipt = previewReceipt();
       const sendFn = vi

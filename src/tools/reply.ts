@@ -61,11 +61,9 @@ export function registerReplyTool(server: McpServer): void {
         'requires confirm=true, acknowledgeExternalReply=true, and a valid replyIntentReceipt from ' +
         'a prior mail_reply_preview call, AND immediately re-fetches and re-validates the source ' +
         'message identity/Reply-To/threading before submitting — any drift since preview is ' +
-        'rejected before any SMTP connection. LIVE REPLY IS UNCONDITIONALLY DISABLED IN THIS ' +
-        'VERSION (0.5.2): a fully-confirmed, fully-valid dryRun=false call is still refused before ' +
-        'any credential is requested, and — critically — does NOT consume the receipt, so the same ' +
-        'receipt remains usable (until it expires) once live reply ships in a separate, ' +
-        'live-validated task. mail_reply_preview and dryRun=true both work fully today. No Cc, no ' +
+        'rejected before any SMTP connection. Controlled live reply is enabled in 0.5.3; real ' +
+        'Bridge validation is still pending after a full MCP process restart. mail_reply_preview ' +
+        'and dryRun=true both work fully. No Cc, no ' +
         'reply-all, no HTML/attachments, no custom headers; From is restricted to the configured ' +
         'Bridge account identity.',
       inputSchema,

@@ -742,22 +742,29 @@ could never let one type's consumption record satisfy another's. See
 "cross-purpose receipt rejection" suites, and `tests/security-send-intent-replay-guard.test.ts`'s
 "purpose-prefixed nonces" suite.
 
-## Live reply/forward is disabled (0.5.2)
+## Live forward is disabled; live reply is gated open as of 0.5.3
 
-Mirrors 0.4.0's `mail_delete_permanently` gate and 0.5.0's original `mail_send` gate: `LIVE_REPLY_
-DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) are unconditionally `true` — no config
-flag, no environment variable, a hardcoded constant a future task flips only after live-validating
-each path against the real Bridge, exactly as 0.5.1 did for `mail_send`. Preview and `dryRun: true`
-are unaffected and fully functional. One deliberate difference from `mail_send`'s replay-guard
-ordering: the feature-gate check runs **before** the replay guard consumes the receipt's one-time
-nonce (`src/smtp/reply-send.ts`/`forward-send.ts`), so a gate-blocked call — which causes no external
-side effect — never burns an otherwise-valid receipt. This is correct because "at most one attempt"
-is meant to bound real attempts, and a call that cannot possibly reach SMTP was never one; once the
-gate opens in a future version, the ordering downstream of it collapses to exactly `mail_send`'s
-existing at-most-once semantics (`tests/smtp-reply-send.test.ts`/`smtp-forward-send.test.ts`'s
-"feature gate ordering" suites test both the gate-closed-preserves-the-receipt case and the
-gate-open-still-enforces-at-most-once case via an injectable `deps.liveDisabled` test seam that
-production code never sets).
+Mirrors 0.4.0's `mail_delete_permanently` gate and 0.5.0's original `mail_send` gate:
+`LIVE_REPLY_DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) started 0.5.2 both
+unconditionally `true` — no config flag, no environment variable, hardcoded constants. **0.5.3
+("Controlled Live Reply") flips `LIVE_REPLY_DISABLED` to `false`**, enabling controlled live reply
+in code. Real Bridge validation, including threading and Sent/Inbox placement, is still pending;
+it is performed separately after a full MCP process restart. No real reply was sent as part of this
+implementation. `LIVE_FORWARD_DISABLED` stays `true`, unchanged; forward remains preview/dry-run-only pending its own separate
+live-validation task. No 0.5.2 reply protection was relaxed to ship this flip: the consent gate,
+full `replyIntentReceipt` verification (HMAC, TTL, exact source-fingerprint/text-hash/recipient/
+subject/threading-hash match), the fresh source re-fetch and re-derivation immediately before
+submission, and the replay guard all remain exactly as built.
+
+One deliberate, still-true difference from `mail_send`'s replay-guard ordering: the feature-gate
+check runs **before** the replay guard consumes the receipt's one-time nonce
+(`src/smtp/reply-send.ts`/`forward-send.ts`), so a gate-blocked call — which causes no external side
+effect — never burns an otherwise-valid receipt. This still matters for `mail_forward` (whose gate
+remains closed) and remains true in code for `mail_reply` even though its gate is now open by
+default; `tests/smtp-reply-send.test.ts`'s "feature gate ordering" suite exercises the gate-closed
+path via an injectable `deps.liveDisabled: true` override — the same test seam that let 0.5.2 prove
+this behavior before any gate was ever open, and that now proves the gate-closed code path (which
+`mail_forward` still exercises for real) wasn't accidentally lost when `mail_reply`'s default flipped.
 
 ## Reporting
 
@@ -765,7 +772,8 @@ This is a personal, local-only project whose only network-facing surface beyond 
 heavily-restricted set: the single outbound HTTPS request `mail_unsubscribe` may make (see "External HTTP
 side effect" above), and — as of 0.5.1 — the loopback-only, receipt-gated, at-most-once-per-attempt SMTP
 connection `mail_send` makes on a fully-confirmed live call (see "Live SMTP submission (0.5.1)"). As of
-0.5.2, `mail_reply`/`mail_forward` share that same connection path, but live execution remains
-unconditionally feature-gated off pending separate validation (see "Live reply/forward is disabled"
-above). If you fork or extend it and find a security issue, treat it with the same care as the points
-above: prefer removing a footgun over rationalizing it.
+0.5.3, `mail_reply` shares that same connection path and is no longer feature-gated off (pending its own
+separate live-validation task); `mail_forward` remains unconditionally feature-gated off (see "Live
+forward is disabled; live reply is gated open as of 0.5.3" above). If you fork or extend it and find a
+security issue, treat it with the same care as the points above: prefer removing a footgun over
+rationalizing it.

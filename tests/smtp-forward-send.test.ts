@@ -371,4 +371,23 @@ describe('sendForward (0.5.2)', () => {
       expect(sendFn).not.toHaveBeenCalled();
     });
   });
+
+  describe('0.5.3 regression: forward gate is unaffected by the reply gate being enabled', () => {
+    it('with no override, a fully valid live forward call is still rejected by the real (still-true) LIVE_FORWARD_DISABLED gate', async () => {
+      const receipt = previewReceipt();
+      const sendFn = vi.fn();
+      const result = await sendForward(
+        source(),
+        { ...basePayload, forwardIntentReceipt: receipt, ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn }, // no liveDisabled override — the real gate
+      );
+      expect(result.outcome).toBe('rejected');
+      expect(result.submissionAttempted).toBe(false);
+      expect(sendFn).not.toHaveBeenCalled();
+      expect(getPassword).not.toHaveBeenCalled();
+      expect(result.reasons.join(' ')).toMatch(/disabled/i);
+    });
+  });
 });

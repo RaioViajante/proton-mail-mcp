@@ -635,4 +635,21 @@ describe('mail_send (0.5.1 — live path)', () => {
       expect(sendFn).not.toHaveBeenCalled();
     });
   });
+
+  describe('0.5.3 regression: mail_send is unaffected by enabling live reply', () => {
+    it('sendMail never imports or consults the reply/forward feature gates — a live send still reaches the transport exactly once, unconditionally', async () => {
+      const receipt = previewReceipt(smtpConfig);
+      const sendFn = vi
+        .fn()
+        .mockResolvedValue({ accepted: ['a@example.com'], rejected: [], response: '250 OK' });
+      const result = await sendMail(
+        { ...validPayload, sendIntentReceipt: receipt, ...liveIntent },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn },
+      );
+      expect(result.outcome).toBe('accepted');
+      expect(sendFn).toHaveBeenCalledTimes(1);
+    });
+  });
 });

@@ -145,7 +145,7 @@ describe('mail_reply (tool-level, 0.5.2)', () => {
     expect(parsed.submissionAttempted).toBeUndefined();
   });
 
-  it('live reply is unconditionally blocked even with full consent + a valid receipt', async () => {
+  it('0.5.3: live reply is no longer gate-blocked at the tool level — it reaches the credential/SMTP step (fails here only because this unit test has no real Bridge/TLS cert, never because of the feature gate)', async () => {
     wireBridge(
       createFakeImapClient({ mailbox: { exists: 1 }, fetchResults: [fakeEnvelopeMessage()] }),
     );
@@ -167,9 +167,15 @@ describe('mail_reply (tool-level, 0.5.2)', () => {
       acknowledgeExternalReply: true,
     });
     const parsed = parseSend(liveResult);
-    expect(parsed.outcome).toBe('rejected');
-    expect(parsed.submissionAttempted).toBe(false);
-    expect(bridgeConfig.getBridgePassword).not.toHaveBeenCalled();
+    // Not gate-rejected: the gate's own rejection reason ("disabled") never
+    // appears, proving the block itself is gone.
+    expect(parsed.reasons.join(' ')).not.toMatch(/disabled/i);
+    // The credential step IS reached now (the gate used to prevent this).
+    expect(bridgeConfig.getBridgePassword).toHaveBeenCalledTimes(1);
+    // Submission fails here purely because '/fake/cert.pem' doesn't exist —
+    // an infrastructure limit of this unit test, not a gate or logic bug.
+    expect(parsed.outcome).toBe('failed');
+    expect(parsed.connectionEstablished).toBe(false);
   });
 });
 

@@ -27,7 +27,7 @@ import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.5.2';
+const SERVER_VERSION = '0.5.3';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -139,9 +139,21 @@ const SERVER_VERSION = '0.5.2';
  * refused before any credential is requested and, notably, does NOT consume
  * its receipt (checked before the replay guard, unlike mail_send — a
  * gate-blocked call caused no external side effect, so it was never a real
- * "attempt"). A separate task will live-validate and enable each, exactly
- * as 0.5.1 did for mail_send. See src/smtp/reply-send.ts, forward-send.ts,
- * and SECURITY.md.
+ * "attempt"). See src/smtp/reply-send.ts, forward-send.ts, and SECURITY.md
+ * for the current gate states and pending validation.
+ * V5.3 (0.5.3, "Controlled Live Reply") lifts LIVE_REPLY_DISABLED only —
+ * LIVE_FORWARD_DISABLED stays true, unchanged, and mail_send/mail_send_preview
+ * are untouched. Every 0.5.2 reply protection remains exactly as built:
+ * consent gate, full replyIntentReceipt verification (HMAC, TTL, exact
+ * source fingerprint/text-hash/recipient/subject/threading-hash match),
+ * fresh source re-fetch and re-derivation immediately before submission,
+ * and the replay guard consuming the `reply:`-prefixed nonce right before
+ * the credential is requested — none of it was relaxed to ship this gate
+ * flip. Real Bridge validation is still pending; a separate task performs it
+ * (after a required process restart — this gate flip only takes effect in
+ * a freshly started server). No real reply was sent in this implementation
+ * task. See src/smtp/feature-gates.ts and SECURITY.md ("Live forward is
+ * disabled; live reply is gated open as of 0.5.3").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { classifySmtpError, classifySmtpSuccess } from '../src/smtp/outcome.js';
+import {
+  classifySmtpError,
+  classifySmtpSuccess,
+  sanitizeRecipientList,
+} from '../src/smtp/outcome.js';
 
 describe('classifySmtpSuccess', () => {
   it('all recipients accepted: outcome accepted, not uncertain', () => {
@@ -159,5 +163,43 @@ describe('classifySmtpError — never guesses acceptedRecipients/rejectedRecipie
       expect(result.acceptedRecipients).toEqual([]);
       expect(result.rejectedRecipients).toEqual([]);
     }
+  });
+});
+
+describe('sanitizeRecipientList (0.5.1, section 6 — never echo raw SMTP internals)', () => {
+  it('returns the caller-known address when the library reports exactly it', () => {
+    expect(sanitizeRecipientList(['a@example.com'], ['a@example.com'])).toEqual(['a@example.com']);
+  });
+
+  it('matches case-insensitively but returns the KNOWN (caller-normalized) spelling, not the library-reported one', () => {
+    expect(sanitizeRecipientList(['A@Example.com'], ['a@example.com'])).toEqual(['a@example.com']);
+  });
+
+  it('drops any address the library reports that the caller never actually submitted', () => {
+    expect(
+      sanitizeRecipientList(
+        ['a@example.com', 'internal-bridge-only@bridge.local'],
+        ['a@example.com'],
+      ),
+    ).toEqual(['a@example.com']);
+  });
+
+  it('drops a known address entirely if the library never reported it', () => {
+    expect(sanitizeRecipientList([], ['a@example.com', 'b@example.com'])).toEqual([]);
+    expect(sanitizeRecipientList(['a@example.com'], ['a@example.com', 'b@example.com'])).toEqual([
+      'a@example.com',
+    ]);
+  });
+
+  it('preserves the known list order, not the library-reported order', () => {
+    expect(
+      sanitizeRecipientList(['b@example.com', 'a@example.com'], ['a@example.com', 'b@example.com']),
+    ).toEqual(['a@example.com', 'b@example.com']);
+  });
+
+  it('never duplicates an address even if the library reports it more than once', () => {
+    expect(sanitizeRecipientList(['a@example.com', 'a@example.com'], ['a@example.com'])).toEqual([
+      'a@example.com',
+    ]);
   });
 });

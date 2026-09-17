@@ -1,15 +1,15 @@
 import {
+  SEND_INTENT_RECEIPT_TTL_MS,
   validateSendIntentReceipt,
   type SendReceiptRejectionReason,
 } from '../security/send-intent-receipt.js';
+import { consumeReceiptNonce } from '../security/send-intent-replay-guard.js';
 import type { ResolvedSmtpConfig } from './config.js';
 import { validateSendIntent, type RawSendParams } from './intent.js';
-import type { SmtpOutcome } from './outcome.js';
+import { sanitizeRecipientList, type SmtpOutcome } from './outcome.js';
+import { submitSmtp, type SmtpSendFn } from './transport.js';
 
-/** Stable, loggable reason code — never a free-form sentence — for why a live call was refused, mirroring `LIVE_PERMANENT_DELETE_DISABLED_REASON`. */
-export const LIVE_SEND_DISABLED_REASON = 'liveSendDisabled';
-
-export type SendOutcome = SmtpOutcome | 'blocked';
+export type SendOutcome = SmtpOutcome;
 
 export interface SendParams extends RawSendParams {
   /** Pass back exactly the `sendIntentReceipt` `mail_send_preview` returned — never modified. Required for a live call; ignored for a dry run. */
@@ -17,6 +17,20 @@ export interface SendParams extends RawSendParams {
   dryRun: boolean;
   confirm: boolean;
   acknowledgeExternalSend: boolean;
+}
+
+export interface SendMailDeps {
+  /**
+   * Resolves the Bridge SMTP password from the macOS Keychain (see
+   * `src/bridge/config.ts`'s `getBridgePassword`). Only ever invoked for a
+   * live call, and only after consent, intent, receipt, and replay-guard
+   * checks have ALL already passed — a dry run, or a live call rejected by
+   * any earlier check, never calls this and therefore never touches the
+   * Keychain.
+   */
+  getPassword: () => Promise<string>;
+  /** Test seam only — see `src/smtp/transport.ts`'s `SmtpSendFn`. Omitted in production, where `submitSmtp` uses the real nodemailer transport. */
+  sendFn?: SmtpSendFn;
 }
 
 export interface SendResult {
@@ -29,6 +43,15 @@ export interface SendResult {
   subject: string;
   bodyLength: number;
   reasons: string[];
+  /**
+   * Only present for a dry run when a `sendIntentReceipt` was supplied:
+   * whether it would pass full verification (structure, signature, expiry,
+   * exact intent match) right now. A dry run NEVER consumes the
+   * replay-guard nonce, even when this is `true` — checking a receipt this
+   * way must never cost the caller their one live attempt with it. See
+   * `src/security/send-intent-replay-guard.ts`.
+   */
+  receiptValid?: boolean;
   /** Every field below is present only for a live (`dryRun: false`) call — a dry-run never attempts anything, so nothing below is meaningful yet. */
   connectionEstablished?: boolean;
   authenticated?: boolean;
@@ -38,10 +61,8 @@ export interface SendResult {
   smtpResponseCategory?: string | null;
   outcome?: SendOutcome;
   deliveryUncertain?: boolean;
-  /** Always `null` in 0.5.0 — this project does not yet observe or model the Bridge's own Sent-folder behavior after a submission; see SECURITY.md ("Sent-folder placement is not modeled yet"). */
+  /** Always `null` in 0.5.1 — this project does not yet observe or model the Bridge's own Sent-folder behavior after a submission; see SECURITY.md ("Sent-folder placement is not modeled yet"). */
   sentFolderObserved?: null;
-  blocked?: boolean;
-  blockReason?: string;
 }
 
 function receiptRejectionMessage(reason: SendReceiptRejectionReason): string {
@@ -65,30 +86,52 @@ function receiptRejectionMessage(reason: SendReceiptRejectionReason): string {
   }
 }
 
+/** Shared shape for every pre-submission live rejection (invalid intent, invalid receipt, replayed receipt) — zero SMTP attempt, every phase flag false. `intentValidated` is `false` only for the invalid-intent case; a receipt/replay rejection still had a valid intent. */
+function preSubmissionRejection(
+  base: Pick<SendResult, 'operation' | 'dryRun' | 'from' | 'to' | 'cc' | 'subject' | 'bodyLength'>,
+  intentValidated: boolean,
+  reasons: string[],
+): SendResult {
+  return {
+    ...base,
+    intentValidated,
+    reasons,
+    connectionEstablished: false,
+    authenticated: false,
+    submissionAttempted: false,
+    acceptedRecipients: [],
+    rejectedRecipients: [],
+    smtpResponseCategory: null,
+    outcome: 'rejected',
+    deliveryUncertain: false,
+    sentFolderObserved: null,
+  };
+}
+
 /**
- * `mail_send` core (0.5.0): implemented and fully testable — intent
- * validation, the dryRun/confirm/acknowledgeExternalSend consent gate, and
- * full `sendIntentReceipt` verification all run for real — but a
- * fully-confirmed live call with a valid receipt is refused by a hard
- * feature gate before any SMTP connection is even attempted. See
- * `src/smtp/transport.ts`'s `submitSmtp`, never called from this path in
- * 0.5.0, and SECURITY.md ("Live SMTP submission is feature-gated off"). This
- * mirrors `mutations/permanent-delete.ts`'s `deletePermanently` exactly.
+ * `mail_send` core (0.5.1, "Controlled Live SMTP"): live submission is no
+ * longer feature-gated off — every protection built and unit-tested in
+ * 0.5.0 (consent gate, intent validation, full `sendIntentReceipt`
+ * verification) now actually guards a real SMTP submission via
+ * `src/smtp/transport.ts`'s `submitSmtp`, plus one new check this version
+ * adds: the replay guard (`src/security/send-intent-replay-guard.ts`) —
+ * see its module doc and SECURITY.md ("Send-intent receipt replay").
  *
- * Validation order is deliberate: the consent gate is a pure input check
- * that rejects before any other work (mirrors every other mutation in this
- * project); intent validation runs next and is identical to what
- * `mail_send_preview` runs, so the two can never silently disagree about
- * what "valid" means; only once a valid intent exists does receipt
- * verification run, since a receipt is meaningless without something to
- * compare it against; only once every one of those passes does the feature
- * gate get a chance to block the (otherwise fully legitimate) live attempt.
+ * Validation order is deliberate and unchanged in spirit from 0.5.0: the
+ * consent gate rejects before any other work; intent validation runs next
+ * (identical to `mail_send_preview`, so the two can never disagree); only
+ * once a valid intent exists does receipt verification run; only once the
+ * receipt verifies does the replay guard consume its one-time nonce —
+ * **irreversibly, regardless of what happens next** — and only after that
+ * does this function ever ask for a credential or open a socket. Each check
+ * is a pure, zero-network gate until the very last step.
  */
-export function sendMail(
+export async function sendMail(
   params: SendParams,
   smtpConfig: ResolvedSmtpConfig,
   signingSecret: Buffer | undefined,
-): SendResult {
+  deps?: SendMailDeps,
+): Promise<SendResult> {
   const { dryRun, confirm, acknowledgeExternalSend, sendIntentReceipt } = params;
 
   if (!dryRun && (!confirm || !acknowledgeExternalSend)) {
@@ -110,24 +153,33 @@ export function sendMail(
   };
 
   if (dryRun) {
-    return { ...base, intentValidated: validation.valid, reasons: validation.reasons };
+    const result: SendResult = {
+      ...base,
+      intentValidated: validation.valid,
+      reasons: [...validation.reasons],
+    };
+    // Dry-run receipt check (0.5.1, section 12): informational only, zero
+    // SMTP, and — critically — never consumes the replay-guard nonce. Only
+    // runs when a receipt was actually supplied and there's a valid intent
+    // to check it against; an invalid intent has nothing for the receipt to
+    // match, so it's left unchecked rather than reported as a confusing
+    // double failure.
+    if (sendIntentReceipt !== undefined && validation.intent) {
+      const receiptCheck = validateSendIntentReceipt(
+        sendIntentReceipt,
+        signingSecret,
+        validation.intent,
+      );
+      result.receiptValid = receiptCheck.valid;
+      if (!receiptCheck.valid) {
+        result.reasons = [...result.reasons, receiptRejectionMessage(receiptCheck.reason)];
+      }
+    }
+    return result;
   }
 
   if (!validation.valid || !validation.intent) {
-    return {
-      ...base,
-      intentValidated: false,
-      reasons: validation.reasons,
-      connectionEstablished: false,
-      authenticated: false,
-      submissionAttempted: false,
-      acceptedRecipients: [],
-      rejectedRecipients: [],
-      smtpResponseCategory: null,
-      outcome: 'rejected',
-      deliveryUncertain: false,
-      sentFolderObserved: null,
-    };
+    return preSubmissionRejection(base, false, validation.reasons);
   }
 
   const receiptValidation = validateSendIntentReceipt(
@@ -136,41 +188,89 @@ export function sendMail(
     validation.intent,
   );
   if (!receiptValidation.valid) {
+    return preSubmissionRejection(base, true, [
+      ...validation.reasons,
+      receiptRejectionMessage(receiptValidation.reason),
+    ]);
+  }
+
+  // Replay guard (0.5.1): the receipt's nonce is consumed HERE — before a
+  // credential is even requested, let alone a socket opened — so a second
+  // call presenting this exact receipt (concurrent or sequential, whatever
+  // happened to the first attempt) can never reach a second SMTP attempt.
+  // See src/security/send-intent-replay-guard.ts for exactly what this does
+  // and does not guarantee.
+  const receiptExpiresAt =
+    Date.parse(receiptValidation.receipt.issuedAt) + SEND_INTENT_RECEIPT_TTL_MS;
+  const nonce = consumeReceiptNonce(receiptValidation.receipt.id, receiptExpiresAt);
+  if (!nonce.consumed) {
+    return preSubmissionRejection(base, true, [
+      ...validation.reasons,
+      'sendIntentReceipt has already been used for a previous mail_send attempt; call ' +
+        'mail_send_preview again for a fresh receipt (see SECURITY.md, "Send-intent receipt ' +
+        'replay").',
+    ]);
+  }
+
+  // Every check above passed and the receipt is now irrevocably spent. This
+  // is the one path in this project that may submit a live email.
+  if (!deps) {
+    // Internal wiring invariant, not a caller-facing input problem — the
+    // registered `mail_send` tool always supplies `deps`; only a test or a
+    // future internal caller could hit this.
+    throw new Error('sendMail: deps.getPassword is required once dryRun=false reaches submission.');
+  }
+
+  let password: string;
+  try {
+    password = await deps.getPassword();
+  } catch (error) {
     return {
       ...base,
       intentValidated: true,
-      reasons: [...validation.reasons, receiptRejectionMessage(receiptValidation.reason)],
+      reasons: [
+        ...validation.reasons,
+        error instanceof Error ? error.message : 'Could not retrieve the Bridge SMTP credential.',
+      ],
       connectionEstablished: false,
       authenticated: false,
       submissionAttempted: false,
       acceptedRecipients: [],
       rejectedRecipients: [],
       smtpResponseCategory: null,
-      outcome: 'rejected',
+      outcome: 'failed',
       deliveryUncertain: false,
       sentFolderObserved: null,
     };
   }
 
-  // Feature gate (0.5.0): consent gate, intent validation, and receipt
-  // verification all passed, but live SMTP submission is refused
-  // unconditionally, before any network connection is attempted. Live send
-  // ships in a separate, explicitly authorized version after dedicated
-  // live validation.
+  const attempt = await submitSmtp(
+    smtpConfig,
+    password,
+    {
+      from: validation.intent.from,
+      to: validation.intent.to,
+      cc: validation.intent.cc,
+      subject: validation.intent.subject,
+      text: params.text,
+    },
+    deps.sendFn,
+  );
+
+  const knownRecipients = [...validation.intent.to, ...validation.intent.cc];
+
   return {
     ...base,
     intentValidated: true,
-    reasons: validation.reasons,
-    connectionEstablished: false,
-    authenticated: false,
-    submissionAttempted: false,
-    acceptedRecipients: [],
-    rejectedRecipients: [],
-    smtpResponseCategory: null,
-    outcome: 'blocked',
-    deliveryUncertain: false,
+    reasons: [...validation.reasons, ...attempt.reasons],
+    connectionEstablished: attempt.connectionEstablished,
+    authenticated: attempt.authenticated,
+    submissionAttempted: attempt.submissionAttempted,
+    acceptedRecipients: sanitizeRecipientList(attempt.acceptedRecipients, knownRecipients),
+    rejectedRecipients: sanitizeRecipientList(attempt.rejectedRecipients, knownRecipients),
+    smtpResponseCategory: attempt.smtpResponseCategory,
+    outcome: attempt.outcome,
+    deliveryUncertain: attempt.deliveryUncertain,
     sentFolderObserved: null,
-    blocked: true,
-    blockReason: LIVE_SEND_DISABLED_REASON,
   };
 }

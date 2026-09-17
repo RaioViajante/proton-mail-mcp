@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import type { SendIntent } from '../smtp/intent.js';
 
@@ -18,12 +18,25 @@ import type { SendIntent } from '../smtp/intent.js';
  * `mail_send` refuses to submit unless the payload it was given re-derives,
  * field for field, to that exact signed intent.
  *
- * ## Statelessness
+ * ## Statelessness (through 0.5.0) and the 0.5.1 replay exception
  *
- * As with restore receipts, this project keeps no server-side memory of a
- * previewed send. The receipt is the caller's problem to hold onto between
- * the two calls; every field is authenticated (see "Integrity" below), so a
- * receipt that was not issued by this exact server install, or that was
+ * Through 0.5.0, this project kept no server-side memory of a previewed
+ * send — live submission was unconditionally gated off, so a receipt being
+ * replayable had no consequence yet. 0.5.1 lifts that gate, which makes
+ * replay a real concern: a receipt is valid for its full
+ * {@link SEND_INTENT_RECEIPT_TTL_MS} window, so without something to stop
+ * it, a caller (or a buggy/compromised client) calling `mail_send` twice
+ * with the same still-valid receipt could submit the same message twice.
+ * `id` below (a random per-receipt nonce, included in the signed payload) is
+ * the deliberately minimal fix: `src/security/send-intent-replay-guard.ts`
+ * keeps a small in-memory, process-lifetime set of already-consumed
+ * receipt ids and refuses to submit a second time for the same one. This is
+ * an explicit, documented, narrow exception to "no server-side memory" —
+ * not a general session/history store, bounded to exactly the TTL window,
+ * and gone on process restart (see that module's doc comment and
+ * SECURITY.md, "Send-intent receipt replay" for the limitations this
+ * accepts). Every other field is authenticated (see "Integrity" below), so
+ * a receipt that was not issued by this exact server install, or that was
  * modified in any way after issuance, fails verification and is never
  * trusted.
  *
@@ -74,6 +87,8 @@ export interface SendIntentReceiptEnvelope {
   subject: string;
   bodyHash: string;
   issuedAt: string;
+  /** Random per-receipt nonce (16 bytes, hex) — the replay-guard's single-use key; see "Statelessness" above. Signed like every other field, so it cannot be stripped or swapped without invalidating the signature. */
+  id: string;
   signature: string;
 }
 
@@ -86,6 +101,7 @@ export const SendIntentReceiptEnvelopeSchema = z
     subject: z.string().max(2000),
     bodyHash: z.string().regex(/^[0-9a-f]{64}$/, 'bodyHash must be a 64-char hex SHA-256 digest'),
     issuedAt: z.string().min(1),
+    id: z.string().regex(/^[0-9a-f]{32}$/, 'id must be a 32-char hex nonce'),
     signature: z.string().regex(/^[0-9a-f]{64}$/, 'signature must be a 64-char hex SHA-256 HMAC'),
   })
   .strict();
@@ -108,6 +124,7 @@ function signingPayloadString(fields: Omit<SendIntentReceiptEnvelope, 'signature
     subject: fields.subject,
     bodyHash: fields.bodyHash,
     issuedAt: fields.issuedAt,
+    id: fields.id,
   });
 }
 
@@ -142,10 +159,16 @@ export function verifySendIntentReceiptSignature(
   return hexDigestsEqual(expected, envelope.signature);
 }
 
+/** 16 random bytes, hex-encoded — the replay-guard nonce for one receipt. Generated fresh by `mail_send_preview` on every call, never reused, never derived from the intent (so it carries no information about the message). */
+export function generateReceiptId(): string {
+  return randomBytes(16).toString('hex');
+}
+
 /** Builds the unsigned receipt fields from a validated {@link SendIntent} — the single place that maps one shape to the other, so preview and verification can never disagree on what "the intent" means. */
 export function receiptFieldsFromIntent(
   intent: SendIntent,
   issuedAt: string,
+  id: string = generateReceiptId(),
 ): Omit<SendIntentReceiptEnvelope, 'signature'> {
   return {
     v: SEND_INTENT_RECEIPT_VERSION,
@@ -155,6 +178,7 @@ export function receiptFieldsFromIntent(
     subject: intent.subject,
     bodyHash: intent.bodyHash,
     issuedAt,
+    id,
   };
 }
 

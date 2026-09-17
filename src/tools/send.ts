@@ -1,8 +1,12 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { getSendIntentSigningSecretOrUndefined, loadSmtpConfig } from '../bridge/config.js';
+import {
+  getBridgePassword,
+  getSendIntentSigningSecretOrUndefined,
+  loadSmtpConfig,
+} from '../bridge/config.js';
 import { MAX_SEND_RECIPIENTS } from '../smtp/policy.js';
-import { LIVE_SEND_DISABLED_REASON, sendMail } from '../smtp/send.js';
+import { sendMail } from '../smtp/send.js';
 
 export const inputSchema = z.object({
   from: z
@@ -61,18 +65,23 @@ export function registerSendTool(server: McpServer): void {
   server.registerTool(
     'mail_send',
     {
-      title: 'Send mail (live submission disabled)',
+      title: 'Send mail (live, controlled)',
       description:
-        'Submits a plain-text email over SMTP to the local Proton Mail Bridge — external side ' +
-        'effect: sends a real outbound message once live execution is enabled in a future version. ' +
-        'Defaults to dryRun=true, which validates the intent (sender/recipients/subject/body) and ' +
-        'previews the outcome without any SMTP connection. Live execution (dryRun=false) requires ' +
-        'confirm=true, acknowledgeExternalSend=true, AND a valid sendIntentReceipt from ' +
-        'mail_send_preview matching this exact payload — but even with everything correct, live ' +
-        `submission is UNCONDITIONALLY DISABLED by a hard feature gate: the call returns ` +
-        `blocked: true, blockReason: "${LIVE_SEND_DISABLED_REASON}", before any SMTP connection is ` +
-        'attempted. This is a deliberate, documented limitation, not a bug — live send ships in a ' +
-        'separate, explicitly authorized version after dedicated live validation. See SECURITY.md. ' +
+        'Submits a plain-text email over SMTP to the local Proton Mail Bridge — SENDS A REAL ' +
+        'EXTERNAL EMAIL when dryRun=false and every requirement below is met; this is an external ' +
+        'side effect with no undo from this tool. Defaults to dryRun=true, which validates the ' +
+        'intent (sender/recipients/subject/body) and, if a sendIntentReceipt was supplied, checks it ' +
+        'too — all with ZERO SMTP connection. Live execution (dryRun=false) requires ALL of: ' +
+        'confirm=true, acknowledgeExternalSend=true, and a valid sendIntentReceipt from a prior ' +
+        'mail_send_preview call matching this exact from/to/cc/subject/body — call mail_send_preview ' +
+        'first. The receipt is single-use: once a live call consumes it (whether or not the SMTP ' +
+        'attempt itself succeeds), presenting the same receipt again is refused — call ' +
+        'mail_send_preview again for a fresh one. There is NO automatic retry of any kind: a live ' +
+        'call makes at most one SMTP submission attempt; an ambiguous failure is reported as ' +
+        'outcome="uncertain" rather than retried or guessed at. "accepted" means only that the ' +
+        'Bridge SMTP server accepted the submission — never that the message was delivered, ' +
+        'received, or read. Only ever connects to the local, loopback-only Proton Mail Bridge over ' +
+        'STARTTLS/TLS with certificate validation; never any external SMTP host. See SECURITY.md. ' +
         'No reply/forward, HTML, attachments, or Bcc in this version; From is restricted to the ' +
         'configured Bridge account identity.',
       inputSchema,
@@ -90,7 +99,9 @@ export function registerSendTool(server: McpServer): void {
     async (args) => {
       const smtpConfig = loadSmtpConfig();
       const signingSecret = await getSendIntentSigningSecretOrUndefined();
-      const result = sendMail(args, smtpConfig, signingSecret);
+      const result = await sendMail(args, smtpConfig, signingSecret, {
+        getPassword: () => getBridgePassword(smtpConfig.username),
+      });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },
   );

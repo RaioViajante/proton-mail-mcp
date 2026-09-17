@@ -12,13 +12,14 @@ import {
 } from './outcome.js';
 
 /**
- * The real SMTP transport (0.5.0), backed by `nodemailer`. **Not called from
- * `mail_send`'s registered tool path in this version** — the live feature
- * gate in `src/smtp/send.ts` returns `blocked` before this module is ever
- * reached, exactly like `mutations/permanent-delete.ts`'s `expungeExactUids`
- * being implemented and unit-tested but structurally unreachable from
- * `mail_delete_permanently` until a future version's gate removal. See
- * SECURITY.md ("Live SMTP submission is feature-gated off").
+ * The real SMTP transport, backed by `nodemailer`. Built and unit-tested
+ * against controlled fakes in 0.5.0 while `mail_send`'s live feature gate
+ * kept it structurally unreachable — mirroring
+ * `mutations/permanent-delete.ts`'s still-gated `expungeExactUids`. **As of
+ * 0.5.1, that gate is lifted**: `src/smtp/send.ts`'s `sendMail` calls
+ * `submitSmtp` below for real once every pre-submission check (consent,
+ * intent, receipt, replay guard) has passed. See SECURITY.md ("Live SMTP
+ * submission (0.5.1)").
  */
 
 const SMTP_CONNECTION_TIMEOUT_MS = 10_000;

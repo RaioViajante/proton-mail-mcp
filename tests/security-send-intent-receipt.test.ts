@@ -199,3 +199,58 @@ describe('SEND_INTENT_RECEIPT_VERSION', () => {
     expect(SEND_INTENT_RECEIPT_VERSION).toBe(1);
   });
 });
+
+describe('receipt id (0.5.1 replay-guard nonce)', () => {
+  it('receiptFieldsFromIntent generates a random 32-hex-char id when none is supplied', () => {
+    const i = intent();
+    const fieldsA = receiptFieldsFromIntent(i, ISSUED_AT);
+    const fieldsB = receiptFieldsFromIntent(i, ISSUED_AT);
+    expect(fieldsA.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(fieldsB.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(fieldsA.id).not.toBe(fieldsB.id);
+  });
+
+  it('an explicit id is honored instead of generating one', () => {
+    const i = intent();
+    const fields = receiptFieldsFromIntent(i, ISSUED_AT, 'a'.repeat(32));
+    expect(fields.id).toBe('a'.repeat(32));
+  });
+
+  it('two receipts issued for the identical intent+issuedAt still get different ids (and thus different signatures)', () => {
+    const i = intent();
+    const receiptA = makeReceipt(i);
+    const receiptB = makeReceipt(i);
+    expect(receiptA.id).not.toBe(receiptB.id);
+    expect(receiptA.signature).not.toBe(receiptB.signature);
+  });
+
+  it('tampering with id (swapping it for another receipt id) invalidates the signature', () => {
+    const i = intent();
+    const receiptA = makeReceipt(i);
+    const receiptB = makeReceipt(i);
+    const tampered = { ...receiptA, id: receiptB.id };
+    expect(validateSendIntentReceipt(tampered, SECRET, i, NOW)).toEqual({
+      valid: false,
+      reason: 'signatureInvalid',
+    });
+  });
+
+  it('a receipt missing id: rejected as malformed', () => {
+    const i = intent();
+    const receipt = makeReceipt(i) as unknown as Record<string, unknown>;
+    delete receipt.id;
+    expect(validateSendIntentReceipt(receipt, SECRET, i, NOW)).toEqual({
+      valid: false,
+      reason: 'malformedReceipt',
+    });
+  });
+
+  it('a non-hex or wrong-length id: rejected as malformed', () => {
+    const i = intent();
+    const receipt = { ...makeReceipt(i), id: 'not-hex-and-wrong-length' };
+    expect(validateSendIntentReceipt(receipt, SECRET, i, NOW)).toEqual({
+      valid: false,
+      reason: 'malformedReceipt',
+    });
+  });
+});

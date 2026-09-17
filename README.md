@@ -40,11 +40,14 @@ Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-04
   folder creation takes an explicit name and optional parent. None acts on the result of a search or on
   "everything in this folder." See ["Mutation
   model"](#mutation-model).
-- **No send/SMTP tool exists in this codebase**, and no tool ever issues a mailbox-wide EXPUNGE. There is no
-  SMTP/send/reply/forward tool — not "disabled," genuinely not implemented, in any version. V4 (0.4.0) adds
-  `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` — implemented
-  and fully unit-tested, but its live execution is unconditionally refused by a hard feature gate; see ["V4 —
-  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
+- **No mailbox-wide EXPUNGE exists in this codebase**, reachable from any code path, gated or not. V4 (0.4.0)
+  adds `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` —
+  implemented and fully unit-tested, but its live execution is still unconditionally refused by a hard
+  feature gate; see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
+- **Controlled live SMTP send, as of 0.5.1.** `mail_send`/`mail_send_preview` (V5, 0.5.0) are this project's
+  only SMTP capability — loopback-only Bridge transport, plain-text/explicit-recipients only, sender locked
+  to the configured account identity, a signed single-use receipt required for every live call, and no
+  reply/forward tool of any kind. See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
 - **Email content is always labeled untrusted, and can never drive a mutation.** See ["Threat
   model"](#threat-model-prompt-injection-via-email).
 
@@ -91,9 +94,9 @@ src/
     policy.ts                   # sender/recipient/subject/body validation + normalization
     intent.ts                    # builds the normalized SendIntent (+ body hash) preview/send/receipt share
     outcome.ts                    # pure classification of an SMTP attempt into the conservative result model
-    transport.ts                   # nodemailer transport + submitSmtp — implemented, not called live in 0.5.0
+    transport.ts                   # nodemailer transport + submitSmtp — the one function that opens a real SMTP connection
     preview.ts                      # mail_send_preview's core (zero SMTP connections)
-    send.ts                          # mail_send's core (consent gates + receipt check + live feature gate)
+    send.ts                          # mail_send's core (consent gates + receipt check + replay guard + live submission)
   tools/
     list-folders.ts, list-messages.ts, search-mail.ts, get-message.ts,      # V1
     unsubscribe-preview.ts                                                  # V1 (read-only)
@@ -106,6 +109,7 @@ src/
     untrusted-content.ts       # labels + bounds any text pulled from an email
     restore-receipt.ts          # V4 (0.4.2): signed pre-Trash snapshot receipts
     send-intent-receipt.ts       # V5 (0.5.0): signed preview->send intent receipts
+    send-intent-replay-guard.ts   # V5.1 (0.5.1): in-memory single-use receipt nonce, bounds replay
 
 tests/                    # Vitest; no live IMAP connection, no live HTTP to a real mailing list, no live SMTP, see "Development commands"
 scripts/
@@ -232,8 +236,10 @@ Bridge password and never asks for your Proton Account password.
 machine's `mail_send_preview` / `mail_send` receipt-signing secret (Keychain service
 `proton-mail-mcp-send-signing`), the same way `scripts/configure-receipt-signing.sh` does for restore
 receipts. Not run automatically by this task or by anything else — see SECURITY.md ("Send-intent
-receipts"). Without it, `mail_send_preview` simply issues no receipt (and says so); live `mail_send` is
-unconditionally disabled in 0.5.0 regardless.
+receipts"). Without it, `mail_send_preview` simply issues no receipt (and says so); a live `mail_send`
+call fails closed with no receipt to verify, regardless of `dryRun`/`confirm`/`acknowledgeExternalSend`
+(as of 0.5.1, this is the same mechanism that gates every live send — there is no separate feature gate
+on top of it anymore).
 
 ## TLS certificate setup
 
@@ -638,7 +644,9 @@ without including the sender address. Live results retain the normal UID `transi
 
 None of the following exist in this codebase, in any version:
 
-- SMTP, send, reply, forward, or sending a draft — not "disabled," genuinely not implemented
+- reply, forward, sending a draft, HTML/attachments/inline-images/raw-MIME/Bcc/custom-headers on a send —
+  V5 (0.5.0) added a narrow, plain-text/explicit-recipients-only `mail_send`/`mail_send_preview`, live as
+  of 0.5.1, but none of the above; see ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050)
 - a mailbox-wide (unscoped) IMAP EXPUNGE, reachable from any code path, gated or not — see ["Why
   mailbox-wide EXPUNGE is forbidden"](#why-mailbox-wide-expunge-is-forbidden)
 - Proton Block List, Allow List, or Spam List management
@@ -818,10 +826,12 @@ Interpreting a link found in the message _body_ would mean trusting the least st
 spoofed part of an email to decide a live network destination — exactly the class of input this project's
 threat model treats as hostile (see ["Untrusted email content"](#threat-model-prompt-injection-via-email)).
 `List-Unsubscribe`/`List-Unsubscribe-Post` are, by contrast, standardized headers with a narrow, auditable
-grammar. `mailto:` execution would mean this project sending mail for the first time ever, from a project
-whose entire security model rests partly on "no SMTP client exists here" (see SECURITY.md, "No SMTP,
-ever") — out of scope for a first, conservative version. Both are detected and reported by the preview tool
-so you always know they exist; neither is ever executed.
+grammar. `mailto:` execution would have meant this project sending mail for the first time ever, at a
+version (0.3.0) that predates the narrow, explicit-recipients-only SMTP capability this project eventually
+got in 0.5.0 (see ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050)) — out of scope then, and
+`mail_unsubscribe` still has no code path today that derives a send target from message content, so it
+remains out of scope now too. Both are detected and reported by the preview tool so you always know they
+exist; neither is ever executed.
 
 ### Proton's own unsubscribe feature
 
@@ -1119,26 +1129,29 @@ live IMAP state on each call.
 
 ## V5 — SMTP Send Foundation (0.5.0)
 
-Two new tools — this project's first-ever SMTP capability. Deliberately minimal scope: plain-text
-only, no reply/forward (0.5.1, built on top of this transport later), no attachments, sender locked
-to the configured Bridge identity, and **live submission is unconditionally disabled** pending
-dedicated live validation, exactly like `mail_delete_permanently`'s gate.
+Two tools — this project's first-ever SMTP capability, introduced in 0.5.0 with live submission
+unconditionally disabled behind a hard feature gate. **0.5.1 ("Controlled Live SMTP") lifted that
+gate** — every 0.5.0 protection is still in force, plus one new one (the receipt replay guard). Scope
+is still deliberately minimal: plain-text only, no reply/forward, no attachments, sender locked to the
+configured Bridge identity.
 
-### Feature matrix
+### Feature matrix (0.5.1)
 
-| Capability                           | Status                                                                 |
-| ------------------------------------ | ---------------------------------------------------------------------- |
-| Preview a send (`mail_send_preview`) | Supported — zero SMTP connections, validates/normalizes/signs only     |
-| Send — dry-run                       | Supported — validates the intent and receipt, no SMTP connection       |
-| Send — live                          | **Disabled**, unconditionally, pending a separate live-validation task |
+| Capability                           | Status                                                                             |
+| ------------------------------------ | ---------------------------------------------------------------------------------- |
+| Preview a send (`mail_send_preview`) | Supported — zero SMTP connections, validates/normalizes/signs only                 |
+| Send — dry-run                       | Supported — validates the intent and (if supplied) the receipt, no SMTP connection |
+| Send — live                          | Supported — loopback-only, receipt-gated, at-most-one SMTP attempt per receipt     |
 
 ### Why an SMTP capability, and why so narrow
 
-The goal of 0.5.0 is to prove a safe SMTP transport exists and is wired correctly end to end —
+The goal of 0.5.0 was to prove a safe SMTP transport exists and is wired correctly end to end —
 config, secret handling, TLS, sender/recipient/body policy, a signed intent receipt, consent gating —
-without yet trusting it to actually deliver mail. Reply/forward would need to derive `To`/`Subject`/
-threading headers from a read message (a much larger, attacker-influenced surface — see "Threat model"
-below) and are deferred to 0.5.1, built on top of the transport this version establishes.
+without yet trusting it to actually submit mail. 0.5.1 lifts that gate under the same narrow scope:
+plain-text only, explicit recipients only, sender locked to the configured identity. Reply/forward
+would need to derive `To`/`Subject`/threading headers from a read message (a much larger,
+attacker-influenced surface — see "Threat model" below) and remain deferred to a future version, built
+on top of the now-live transport this version establishes.
 
 ### SMTP host (`src/smtp/host-safety.ts`, `src/smtp/config.ts`)
 
@@ -1177,17 +1190,35 @@ SMTP server is currently reachable". When eligible and a send-signing secret is 
 
 ### `mail_send` (`readOnlyHint: false`, `destructiveHint: false`)
 
-Submits a plain-text email over SMTP — an external side effect once live, not a destructive mutation
-of existing mailbox state, so `destructiveHint` stays `false` (the description itself is the warning,
-same MCP-semantics reasoning `mail_restore_from_trash` already uses). Defaults to `dryRun: true`; live
-execution requires `confirm: true`, `acknowledgeExternalSend: true`, **and** a valid `sendIntentReceipt`
-matching the exact payload — but even then, live submission is refused unconditionally:
+Submits a plain-text email over SMTP — an external side effect, not a destructive mutation of existing
+mailbox state, so `destructiveHint` stays `false` (the description itself is the warning, same
+MCP-semantics reasoning `mail_restore_from_trash` already uses). Defaults to `dryRun: true`, which
+validates the intent and (if a `sendIntentReceipt` was supplied) checks it too — zero SMTP connection
+either way. Live execution (`dryRun: false`) requires ALL of `confirm: true`,
+`acknowledgeExternalSend: true`, and a valid `sendIntentReceipt` from a prior `mail_send_preview` call
+matching the exact payload — call `mail_send_preview` first. **As of 0.5.1, a fully-confirmed live call
+actually submits over SMTP** to the local Bridge instance (loopback-only, STARTTLS/TLS with certificate
+validation, never any external host). See SECURITY.md ("Live SMTP submission (0.5.1)").
 
-```json
-{ "blocked": true, "blockReason": "liveSendDisabled" }
-```
+**The receipt is single-use.** The moment a live call's receipt passes verification, its nonce is
+consumed — before a credential is even requested — so presenting that same receipt again (whether the
+first attempt succeeded, failed, or came back `uncertain`) is refused with zero further SMTP attempt.
+There is no automatic retry of any kind, anywhere in this project: call `mail_send_preview` again for a
+fresh receipt if you want to try again. See SECURITY.md ("Send-intent receipt replay", "Duplicate sends
+are worse than an uncertain result").
 
-See SECURITY.md ("Live SMTP submission is feature-gated off").
+**`accepted` is not `delivered`.** The result's `outcome` (`accepted` / `partiallyAccepted` /
+`rejected` / `uncertain` / `failed`) reflects only what the Bridge SMTP server said about the
+submission — never final delivery, never that the message was received or read. `sentFolderObserved`
+stays `null` (0.5.1 still doesn't check Sent — see "Sent-folder placement is not modeled yet" below).
+An ambiguous failure (a dropped connection, a timeout mid-submission) is `uncertain`, never guessed at
+as a clean success or failure.
+
+**Recommended first live validation: self-send.** Set `from` to (or omit it, since it defaults to) the
+configured Bridge account identity, and `to` to that exact same address — sending yourself a
+deterministic, harmless test message is the lowest-risk way to observe how this transport and a real
+Bridge instance actually behave together (including, empirically, whether/how Bridge places the message
+in Sent) before sending to anyone else.
 
 ### Send-intent receipts (`src/security/send-intent-receipt.ts`)
 
@@ -1198,8 +1229,22 @@ with a per-install secret (Keychain service `proton-mail-mcp-send-signing`, dist
 password and the restore-receipt secret); `mail_send` verifies structure, signature, a 15-minute
 expiry, and an exact field-for-field match before ever proceeding. Recipient _order_ is normalized
 before signing, so re-listing the same set differently between calls never causes a false mismatch —
-adding, removing, or moving an address between `to`/`cc` always does. See SECURITY.md ("Send-intent
-receipts") for the full design.
+adding, removing, or moving an address between `to`/`cc` always does. Every receipt also carries a
+random signed nonce (`id`) — see "Send-intent receipt replay" below. See SECURITY.md ("Send-intent
+receipts", "Send-intent receipt replay") for the full design.
+
+### Send-intent receipt replay (0.5.1)
+
+A receipt is valid for its full 15-minute TTL, so on its own it could be presented to `mail_send` more
+than once. `src/security/send-intent-replay-guard.ts` closes the realistic case of this (a caller or
+client re-invoking the same live tool call within one server process's lifetime) with a minimal,
+in-memory, single-use marker per receipt `id` — consumed the instant a receipt verifies, before a
+credential is even requested. This makes a receipt authorize **at most one submission attempt, ever,
+not one success**: any retry, after any outcome, needs a fresh `mail_send_preview` call. This does not
+survive a server restart and does not coordinate across multiple concurrently-running server processes
+— an explicit, documented, accepted limitation, not a claimed guarantee beyond what it actually
+provides. See SECURITY.md ("Send-intent receipt replay") for the full reasoning, including why a
+heavier persistent store was considered and rejected for this version.
 
 ### Sender, recipient, subject, body policy
 
@@ -1211,19 +1256,23 @@ anything but literal content.
 
 ### Result model and SMTP uncertainty
 
-`mail_send`'s live result (once the gate is eventually lifted) never claims "delivered" — SMTP
-acceptance isn't proof of final delivery. Outcomes are `accepted` / `partiallyAccepted` / `rejected` /
-`uncertain` / `failed` / `blocked`; a definitive server response (a numeric SMTP code) drives
-`accepted`/`rejected`, while any ambiguous failure — a dropped connection, a timeout mid-submission —
-is `uncertain` with `deliveryUncertain: true`, and is **never retried automatically** by anything in
-this codebase. See SECURITY.md ("Duplicate sends are worse than an uncertain result").
+`mail_send`'s live result never claims "delivered" — SMTP acceptance isn't proof of final delivery, and
+never means "received" or "read" either. Outcomes are `accepted` / `partiallyAccepted` / `rejected` /
+`uncertain` / `failed`; a definitive server response (a numeric SMTP code) drives `accepted`/`rejected`,
+while any ambiguous failure — a dropped connection, a timeout mid-submission — is `uncertain` with
+`deliveryUncertain: true`, and is **never retried automatically** by anything in this codebase (nor can
+the caller retry with the same receipt — see "Send-intent receipt replay" above). `acceptedRecipients`/
+`rejectedRecipients` only ever echo back addresses the caller itself submitted, normalized — never a
+raw SMTP library internal. See SECURITY.md ("Duplicate sends are worse than an uncertain result").
 
 ### Sent-folder placement is not modeled yet
 
-0.5.0 does not manually `APPEND` a sent message into Sent, and does not yet know how Bridge itself
-places (or doesn't place) a submitted message there. `sentFolderObserved` is reserved (always `null`
-in 0.5.0) for a future live-validated version to fill in once that behavior has actually been
-observed — see SECURITY.md.
+0.5.1 still does not manually `APPEND` a sent message into Sent, and does not yet know how Bridge itself
+places (or doesn't place) a submitted message there. `sentFolderObserved` is reserved (always `null` in
+0.5.1) for a future live-validated version to fill in once that behavior has actually been observed —
+see SECURITY.md. (This is exactly what the separate, subsequent live-validation task — not this
+implementation task — is expected to discover empirically, via a self-send; see the recommendation
+above.)
 
 ## Threat model (prompt injection via email)
 
@@ -1253,9 +1302,10 @@ This server's defenses:
    `confirm: true`, `acknowledgePermanentDeletion: true`, AND `confirmationPhrase` exactly
    `"DELETE PERMANENTLY"` — and even then, live execution is unconditionally refused by a feature gate. See
    ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
-   `mail_send` (0.5.0) requires `dryRun: false`, `confirm: true`, `acknowledgeExternalSend: true`, AND a
-   valid `sendIntentReceipt` matching the exact payload — and even then, live execution is unconditionally
-   refused by a feature gate. See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
+   `mail_send` requires `dryRun: false`, `confirm: true`, `acknowledgeExternalSend: true`, AND a valid
+   `sendIntentReceipt` matching the exact payload — as of 0.5.1, a fully-confirmed call with all of
+   these actually submits over SMTP (loopback-only, at most one attempt per receipt — see "Send-intent
+   receipt replay" in SECURITY.md). See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
 4. **No raw HTML, bounded size.** HTML-only messages are converted to inert plain text before being returned,
    and bodies are capped at 20,000 characters.
 5. **`List-Unsubscribe` is treated as hostile input, structurally.** `mail_unsubscribe` never reads the
@@ -1263,8 +1313,8 @@ This server's defenses:
    `List-Unsubscribe-Post` headers, and every candidate URL passes the SSRF defenses in ["V3 — Controlled
    Unsubscribe"](#v3--controlled-unsubscribe-030) before a single byte is sent.
 6. **`mail_send` never derives anything from email content.** `from`/`to`/`cc`/`subject`/`text` are explicit
-   caller-supplied inputs only, never parsed out of a read message — there is no "reply" or "forward" tool in
-   0.5.0 that could turn an attacker-controlled `Reply-To` or body text into a send target. See
+   caller-supplied inputs only, never parsed out of a read message — there is no "reply" or "forward" tool
+   in this codebase that could turn an attacker-controlled `Reply-To` or body text into a send target. See
    ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050) and SECURITY.md.
 
 If you extend this project with any tool that takes a broader action (a search-based mutation, browser

@@ -23,7 +23,7 @@ import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.5.0';
+const SERVER_VERSION = '0.5.1';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -91,11 +91,19 @@ const SERVER_VERSION = '0.5.0';
  * (src/security/send-intent-receipt.ts) binding the exact validated intent;
  * live mail_send requires dryRun=false, confirm=true,
  * acknowledgeExternalSend=true, AND that receipt matching the payload
- * exactly — but even fully confirmed, live submission is unconditionally
- * refused by a hard feature gate (blocked: true, blockReason:
- * "liveSendDisabled") before any SMTP connection is attempted, mirroring
- * mail_delete_permanently's gate. See src/smtp/send.ts and SECURITY.md
- * ("Live SMTP submission is feature-gated off").
+ * exactly.
+ * V5.1 (0.5.1, "Controlled Live SMTP") lifts the hard feature gate 0.5.0
+ * shipped: a fully-confirmed live mail_send call with a matching receipt now
+ * actually reaches src/smtp/transport.ts's submitSmtp and submits a real
+ * message, mirroring exactly how mail_delete_permanently's gate remains (as
+ * of 0.5.1, still on). Every 0.5.0 protection still applies unchanged, plus
+ * one new one: the receipt's signed nonce is consumed the moment it
+ * verifies — before a credential is even requested — so the SAME receipt
+ * can never cause a second SMTP attempt (src/security/send-intent-replay-
+ * guard.ts). This makes each sendIntentReceipt single-use per submission
+ * *attempt*, not per success — a caller must call mail_send_preview again
+ * for any retry, on any outcome. See src/smtp/send.ts and SECURITY.md
+ * ("Live SMTP submission (0.5.1)", "Send-intent receipt replay").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */

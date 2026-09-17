@@ -1,8 +1,8 @@
 {
   "name": "proton-mail-mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
-  "description": "Local Proton Mail Bridge MCP server with read-only mail intelligence, explicit dry-run-by-default triage mutations, controlled RFC 8058 one-click unsubscribe, and a plain-text-only SMTP send foundation (live submission feature-gated off).",
+  "description": "Local Proton Mail Bridge MCP server with read-only mail intelligence, explicit dry-run-by-default triage mutations, controlled RFC 8058 one-click unsubscribe, and controlled plain-text-only SMTP sending (loopback-only Bridge transport, receipt-gated, at-most-once per attempt).",
   "type": "module",
   "license": "UNLICENSED",
   "engines": {

@@ -1,3 +1,5 @@
+import { addressKey } from './policy.js';
+
 /**
  * Pure classification of an SMTP submission attempt into this project's
  * conservative result model (0.5.0) — see README.md ("mail_send result
@@ -56,6 +58,23 @@ function categoryOf(responseCode: number | undefined, response: string | undefin
 function asAddressList(value: unknown[] | undefined): string[] {
   if (!value) return [];
   return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+/**
+ * Sanitizes `accepted`/`rejected` recipient lists before they ever leave
+ * this project (0.5.1, section 6): intersects whatever the SMTP library
+ * reports against the caller's own normalized recipient set (`known` — the
+ * validated intent's `to`/`cc`), matched case-insensitively via
+ * {@link addressKey}, and returns the caller's own normalized spelling —
+ * never nodemailer's raw echoed string. An address the library reports that
+ * isn't one this project actually submitted is dropped rather than
+ * surfaced; this never happens with a well-behaved SMTP library but this
+ * project does not trust that as the only guarantee. Also drops duplicates
+ * and preserves `known`'s order.
+ */
+export function sanitizeRecipientList(reported: string[], known: readonly string[]): string[] {
+  const reportedKeys = new Set(reported.map((address) => addressKey(address.trim())));
+  return known.filter((address) => reportedKeys.has(addressKey(address)));
 }
 
 /** Classifies a successful (non-throwing) `sendMail` resolution — nodemailer resolves even when SOME recipients were rejected; only a full failure throws. */

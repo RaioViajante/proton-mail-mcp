@@ -15,13 +15,15 @@ import { registerMoveTool } from './tools/move.js';
 import { registerRemoveLabelTool } from './tools/remove-label.js';
 import { registerRestoreFromTrashTool } from './tools/restore-from-trash.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
+import { registerSendPreviewTool } from './tools/send-preview.js';
+import { registerSendTool } from './tools/send.js';
 import { registerTrashTool } from './tools/trash.js';
 import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.4.2';
+const SERVER_VERSION = '0.5.0';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -75,6 +77,25 @@ const SERVER_VERSION = '0.4.2';
  * silently downgrading. This is fully additive: an install with no
  * receipt-signing secret provisioned (scripts/configure-receipt-signing.sh)
  * behaves exactly as 0.4.1 did. See SECURITY.md ("Restore receipts").
+ * V5 (0.5.0, "SMTP Send Foundation") adds mail_send_preview (readOnlyHint:
+ * true, zero SMTP connections) and mail_send (readOnlyHint: false,
+ * destructiveHint: false), the first SMTP capability this project has ever
+ * had — see src/smtp/ and SECURITY.md ("No SMTP, ever" is retired; see "SMTP
+ * host is loopback-only" instead). Scope is deliberately minimal: plain-text
+ * only (no HTML/attachments/inline images/raw MIME/custom headers), no
+ * reply/forward (0.5.1), no Bcc, From locked to the configured Bridge
+ * account identity, recipients capped at 5 total. The SMTP host is
+ * validated loopback-only (127.0.0.0/8, ::1, or "localhost" re-resolved and
+ * re-checked) — this project is a Bridge-only SMTP client, never a
+ * general-purpose one. mail_send_preview issues a signed sendIntentReceipt
+ * (src/security/send-intent-receipt.ts) binding the exact validated intent;
+ * live mail_send requires dryRun=false, confirm=true,
+ * acknowledgeExternalSend=true, AND that receipt matching the payload
+ * exactly — but even fully confirmed, live submission is unconditionally
+ * refused by a hard feature gate (blocked: true, blockReason:
+ * "liveSendDisabled") before any SMTP connection is attempted, mirroring
+ * mail_delete_permanently's gate. See src/smtp/send.ts and SECURITY.md
+ * ("Live SMTP submission is feature-gated off").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -107,6 +128,9 @@ export function createServer(): McpServer {
   registerTrashTool(server);
   registerRestoreFromTrashTool(server);
   registerDeletePermanentlyTool(server);
+
+  registerSendPreviewTool(server);
+  registerSendTool(server);
 
   return server;
 }

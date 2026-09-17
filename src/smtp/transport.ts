@@ -1,0 +1,168 @@
+import { readFileSync } from 'node:fs';
+import { isIP } from 'node:net';
+import { createTransport, type Transporter } from 'nodemailer';
+import type { ResolvedSmtpConfig } from './config.js';
+import { checkSmtpHostStructurallySafe } from './host-safety.js';
+import {
+  classifySmtpError,
+  classifySmtpSuccess,
+  type SmtpAttemptResult,
+  type SmtpLikeError,
+  type SmtpSuccessInfo,
+} from './outcome.js';
+
+/**
+ * The real SMTP transport (0.5.0), backed by `nodemailer`. **Not called from
+ * `mail_send`'s registered tool path in this version** — the live feature
+ * gate in `src/smtp/send.ts` returns `blocked` before this module is ever
+ * reached, exactly like `mutations/permanent-delete.ts`'s `expungeExactUids`
+ * being implemented and unit-tested but structurally unreachable from
+ * `mail_delete_permanently` until a future version's gate removal. See
+ * SECURITY.md ("Live SMTP submission is feature-gated off").
+ */
+
+const SMTP_CONNECTION_TIMEOUT_MS = 10_000;
+const SMTP_GREETING_TIMEOUT_MS = 10_000;
+const SMTP_SOCKET_TIMEOUT_MS = 20_000;
+
+function readTlsCertificate(tlsCertPath: string): string {
+  try {
+    return readFileSync(tlsCertPath, 'utf8');
+  } catch {
+    throw new Error(
+      `Could not read the Proton Mail Bridge TLS certificate at ${tlsCertPath}. See README.md ` +
+        '("TLS certificate setup") for the export steps.',
+    );
+  }
+}
+
+/**
+ * Builds a one-shot (never pooled) `nodemailer` transporter for exactly the
+ * Bridge account this config resolves to. TLS validation is never disabled
+ * (`rejectUnauthorized` stays at its secure default; trust comes from
+ * Bridge's own exported certificate via `tls.ca`, exactly like
+ * `bridge/client.ts`'s IMAP connection). `requireTLS` is set for STARTTLS
+ * mode specifically so a Bridge that unexpectedly doesn't advertise STARTTLS
+ * fails the connection rather than silently falling back to plaintext — see
+ * SECURITY.md ("No plaintext SMTP, ever"). `disableFileAccess`/
+ * `disableUrlAccess` are defense in depth: 0.5.0 has no attachment support
+ * to exploit, but this keeps a future nodemailer message option from ever
+ * being able to read a local file or fetch a URL by surprise.
+ */
+export function createSmtpTransport(config: ResolvedSmtpConfig, password: string): Transporter {
+  // Defense in depth (enforced twice by design, mirroring
+  // mutations/batch.ts's MAX_MUTATION_UIDS comment): SmtpConfigSchema
+  // already rejects a non-loopback host at config-load time, but this
+  // function never trusts that as the only gate — an external SMTP host
+  // must be structurally impossible to reach from here even if some future
+  // caller ever constructs a ResolvedSmtpConfig by hand.
+  const hostCheck = checkSmtpHostStructurallySafe(config.host);
+  if (!hostCheck.safe) {
+    throw new Error(hostCheck.reason ?? `SMTP host "${config.host}" is not permitted.`);
+  }
+  const ca = readTlsCertificate(config.tlsCertPath);
+  return createTransport({
+    host: config.host,
+    port: config.port,
+    secure: config.security === 'tls',
+    requireTLS: config.security === 'starttls',
+    tls: {
+      ca: [ca],
+      rejectUnauthorized: true,
+      // SNI is only valid for DNS hostnames, not IP literals (RFC 6066) —
+      // mirrors bridge/client.ts's identical conditional for IMAP.
+      ...(isIP(config.host) === 0 ? { servername: config.host } : {}),
+    },
+    auth: { user: config.username, pass: password },
+    connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+    greetingTimeout: SMTP_GREETING_TIMEOUT_MS,
+    socketTimeout: SMTP_SOCKET_TIMEOUT_MS,
+    pool: false,
+    disableFileAccess: true,
+    disableUrlAccess: true,
+    // Disabled: the default logger can emit SMTP traffic, which may include
+    // message content or authentication frames — mirrors bridge/client.ts.
+    logger: false,
+  });
+}
+
+export interface SmtpMessage {
+  from: string;
+  to: string[];
+  cc: string[];
+  subject: string;
+  text: string;
+}
+
+/** Sends the live message. Overridable in tests so no test ever opens a real socket — mirrors `unsubscribe/execute.ts`'s injectable `OneClickSender`. */
+export type SmtpSendFn = (
+  transporter: Transporter,
+  message: SmtpMessage,
+) => Promise<SmtpSuccessInfo>;
+
+async function defaultSmtpSend(
+  transporter: Transporter,
+  message: SmtpMessage,
+): Promise<SmtpSuccessInfo> {
+  return transporter.sendMail({
+    from: message.from,
+    to: message.to,
+    cc: message.cc.length > 0 ? message.cc : undefined,
+    subject: message.subject,
+    text: message.text,
+  });
+}
+
+function toSmtpLikeError(error: unknown): SmtpLikeError {
+  if (error && typeof error === 'object') {
+    const err = error as Record<string, unknown>;
+    return {
+      code: typeof err.code === 'string' ? err.code : undefined,
+      command: typeof err.command === 'string' ? err.command : undefined,
+      responseCode: typeof err.responseCode === 'number' ? err.responseCode : undefined,
+      message: error instanceof Error ? error.message : undefined,
+    };
+  }
+  return { message: 'Unknown SMTP error.' };
+}
+
+/**
+ * Full submission attempt: build the transport, send once, classify the
+ * outcome (`src/smtp/outcome.ts`), always close the transport. Never retries
+ * — a failure of any kind, including an ambiguous one, is returned to the
+ * caller exactly once; retrying automatically is exactly what this project
+ * refuses to do (see SECURITY.md, "Duplicate sends are worse than an
+ * uncertain result").
+ */
+export async function submitSmtp(
+  config: ResolvedSmtpConfig,
+  password: string,
+  message: SmtpMessage,
+  sendFn: SmtpSendFn = defaultSmtpSend,
+): Promise<SmtpAttemptResult> {
+  let transporter: Transporter;
+  try {
+    transporter = createSmtpTransport(config, password);
+  } catch (error) {
+    return {
+      connectionEstablished: false,
+      authenticated: false,
+      submissionAttempted: false,
+      acceptedRecipients: [],
+      rejectedRecipients: [],
+      smtpResponseCategory: null,
+      outcome: 'failed',
+      deliveryUncertain: false,
+      reasons: [error instanceof Error ? error.message : 'Could not create the SMTP transport.'],
+    };
+  }
+
+  try {
+    const info = await sendFn(transporter, message);
+    return classifySmtpSuccess(info);
+  } catch (error) {
+    return classifySmtpError(toSmtpLikeError(error));
+  } finally {
+    transporter.close();
+  }
+}

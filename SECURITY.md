@@ -7,18 +7,25 @@ setup, architecture, and threat-model write-up.
 
 - The Proton Mail Bridge password is stored **only** in the macOS Keychain (service
   `proton-mail-mcp`), written there by `scripts/configure-bridge.sh`, and read back at runtime via
-  `security find-generic-password ... -w`.
-- It is never written to a file, never placed in source code, never placed in the Claude Code MCP
-  configuration, and never placed in a committed `.env` file. `.gitignore` also excludes `.env*`,
-  `*.pem`, `*.crt`, `*.key`, `*.p12`, and `*.pfx` as a backstop.
+  `security find-generic-password ... -w`. Bridge issues one credential pair shared by IMAP and SMTP
+  — `mail_send`/`mail_send_preview` (0.5.0) reuse this exact reader, never a second copy of the
+  password.
+- Two more Keychain secrets exist for this project's own self-signed receipts, each its own service,
+  never reused for anything else and never each other: `proton-mail-mcp-receipt-signing` (restore
+  receipts, `scripts/configure-receipt-signing.sh`) and `proton-mail-mcp-send-signing` (send-intent
+  receipts, `scripts/configure-send-signing.sh`, 0.5.0). Neither is a credential to any external
+  system — see "Restore receipts" and "Send-intent receipts" below.
+- None of the above is ever written to a file, never placed in source code, never placed in the
+  Claude Code MCP configuration, and never placed in a committed `.env` file. `.gitignore` also
+  excludes `.env*`, `*.pem`, `*.crt`, `*.key`, `*.p12`, and `*.pfx` as a backstop.
 - This project never uses, asks for, or stores the Proton Account password, recovery phrase,
-  recovery codes, or 2FA tokens. Only the Bridge-issued IMAP password is used — see README.md
+  recovery codes, or 2FA tokens. Only the Bridge-issued IMAP/SMTP password is used — see README.md
   ("Why the Bridge password, not your Proton Account password").
 - Errors are constructed to omit secret values, even when the underlying failure (e.g. a Keychain
-  lookup or an IMAP connection) might otherwise carry one; see `src/bridge/config.ts` and
+  lookup or an IMAP/SMTP connection) might otherwise carry one; see `src/bridge/config.ts` and
   `src/bridge/client.ts`.
-- Non-secret connection settings (host, port, username, TLS certificate path) live outside the
-  repository, in `~/.config/proton-mail-mcp/config.json`.
+- Non-secret connection settings (host, port, username, TLS certificate path, and — as of 0.5.0 — SMTP
+  port/security mode) live outside the repository, in `~/.config/proton-mail-mcp/config.json`.
 
 ## Email body is untrusted input
 
@@ -40,13 +47,37 @@ Bridge binds to). It never connects to a remote IMAP host, and TLS certificate v
 disabled (`rejectUnauthorized` stays at its secure default; trust comes from Bridge's own exported
 certificate, supplied via `tls.ca`).
 
-## No SMTP, ever
+## SMTP host is loopback-only
 
-There is no SMTP client, no send capability, and no reply/forward capability anywhere in this
-codebase — in V1, V2, or V3, and there is no plan to add one. `mail_unsubscribe` (V3, 0.3.0) never
-sends a `mailto:` unsubscribe request for exactly this reason: doing so would mean sending mail for
-the first time ever from this project. It detects and reports a `mailto:`-only mechanism in
-`mail_unsubscribe_preview`, but never executes it — see "External HTTP side effect" below.
+As of 0.5.0 ("SMTP Send Foundation"), this project has an SMTP capability for the first time —
+`mail_send_preview` and `mail_send`, both plain-text-only, both scoped to a single mailbox identity.
+Through 0.4.2 there was none at all (`mail_unsubscribe`, V3/0.3.0, never sends a `mailto:`
+unsubscribe request for exactly the reason this project had no send capability to use — it detects
+and reports a `mailto:`-only mechanism in `mail_unsubscribe_preview` but never executes it; see
+"External HTTP side effect" below).
+
+`mail_send`/`mail_send_preview` are a client for exactly one thing: a locally running Proton Mail
+Bridge instance, never a general-purpose SMTP client:
+
+- The configured SMTP host must resolve to loopback — a loopback IP literal (`127.0.0.0/8`, `::1`)
+  or `localhost`/`*.localhost`, and even `localhost` is re-resolved and every returned address
+  re-checked as loopback before a connection is ever attempted (`src/smtp/host-safety.ts`,
+  `resolveAndValidateLoopbackHost` — the same DNS-rebinding defense `unsubscribe/url-safety.ts` uses
+  for the opposite direction). `smtp.gmail.com`, `smtp.office365.com`, any other public hostname, any
+  LAN IP, and any non-loopback IP literal are all rejected — structurally, not just discouraged — at
+  config-load time (`SmtpConfigSchema`) **and again** at transport-creation time
+  (`createSmtpTransport`), the same "enforced twice by design" pattern `mutations/batch.ts` uses for
+  UID limits.
+- No plaintext SMTP, ever. `SmtpSecurity` (`starttls` | `tls`) has no plaintext member at all — a
+  config that omits security, or names an unrecognized mode, fails validation rather than falling
+  back to anything insecure. STARTTLS mode sets nodemailer's `requireTLS`, so a Bridge that
+  unexpectedly doesn't advertise STARTTLS fails the connection outright instead of silently sending
+  in the clear.
+- TLS certificate validation is never disabled (`rejectUnauthorized` stays at its secure default;
+  trust comes from the same exported Bridge certificate IMAP already uses, via `tls.ca` — reused, not
+  duplicated).
+- Reuses the existing Bridge password from the Keychain (service `proton-mail-mcp`) — Bridge issues
+  one credential pair shared by IMAP and SMTP. No new credential, no Proton Account password, ever.
 
 ## No destructive IMAP commands are ever reachable in 0.4.0
 
@@ -445,10 +476,112 @@ Live permanent deletion ships in a separate, explicitly authorized version after
 validation against a real mailbox — not in this task, and not without the person operating this project
 turning that gate off deliberately in code, reviewed on its own.
 
+## Sender identity is never caller-chosen
+
+`mail_send`/`mail_send_preview`'s `from` is never taken at face value. If supplied, it must
+case-insensitively equal the one mailbox identity this Bridge account's `config.json` already
+resolves to (`src/smtp/policy.ts`, `validateSender`); if omitted, that identity is the default. There
+is no reliable, simple way for this project to enumerate additional Bridge-authorized send-as
+aliases, so 0.5.0 takes the most conservative option: exactly the configured identity, never
+anything else. A caller supplying `from: "ceo@google.com"` (or any other address) is rejected before
+an intent is ever built — see `tests/smtp-policy.test.ts` ("rejects an unauthorized sender (spoofing
+attempt)").
+
+## Recipient, subject, and body policy (0.5.0 scope)
+
+- **Recipients**: explicit `to`/`cc` only — never derived from a message body or any other content.
+  Each address is validated (a deliberately narrow RFC 5322 subset — see `ADDRESS_PATTERN` in
+  `src/smtp/policy.ts`) and rejected outright if it contains any control character, including CR/LF
+  (the concrete header-injection defense: an address like `"a@example.com\r\nBcc: victim@example.com"`
+  fails validation, full stop, before it can ever reach anything that builds a header). Duplicates
+  across `to`+`cc` (case-insensitive) are silently deduplicated, mirroring `dedupeUids`'s precedent
+  for mutation UIDs — not treated as a hard failure. Combined `to`+`cc` is capped at 5 recipients
+  total (`MAX_SEND_RECIPIENTS`); there is no Bcc in this version and no automatic recipient expansion
+  of any kind.
+- **Subject**: non-empty, ≤500 characters, and the same control-character rejection as recipients —
+  no CR/LF, no header injection.
+- **Body**: plain text only, non-empty, ≤50,000 characters, UTF-8 (an unpaired UTF-16 surrogate is
+  rejected rather than silently corrupted on the wire). Exactly like every message body this project
+  reads (see "Email body is untrusted input" above), a body this project _sends_ is data, never
+  interpreted as an instruction, executed, or evaluated — the difference is only that here the
+  content is caller-supplied (trusted input to this call), not attacker-supplied email content; the
+  non-interpretation rule is symmetric regardless of which side of the wire it's on.
+- No HTML, attachments, inline images, calendar invites, arbitrary custom headers, raw MIME, custom
+  Reply-To, arbitrary Message-ID, References, or In-Reply-To in 0.5.0 — deliberately: each adds attack
+  surface without being necessary to prove the SMTP transport works. Reply/forward are 0.5.1 scope,
+  built on top of this transport once it exists, not part of this version at all.
+
+## Send-intent receipts
+
+`mail_send_preview` computes exactly what would be sent and reports it; `mail_send` actually submits.
+Nothing structurally ties those two calls together without a receipt: a caller (or a compromised
+intermediate step) could preview message A and then call `mail_send` with message B, and this project
+would have no way to tell the two apart. This is the same problem `restoreReceipt` solves for the
+Trash/restore round-trip (see "Restore receipts" above), applied to the preview/send round-trip
+instead — `src/security/send-intent-receipt.ts`.
+
+- `mail_send_preview` signs exactly what it validated — normalized `from`, `to`, `cc`, `subject`, and
+  a SHA-256 hash of the body (never the body itself) — with a per-install HMAC-SHA256 secret that
+  lives only in the macOS Keychain (service `proton-mail-mcp-send-signing`, distinct from both the
+  Bridge password and the restore-receipt secret — signing key material is never reused across
+  unrelated purposes in this project, see "Restore receipts" for the identical reasoning).
+- `mail_send` refuses to submit unless the payload it was given re-derives, field for field, to that
+  exact signed intent: structure → signature → expiry (15 minutes, `SEND_INTENT_RECEIPT_TTL_MS`) →
+  exact match, fail-closed at the first failing check — a changed body, subject, sender, or recipient
+  set between preview and send is rejected (`intentMismatch`), never silently accepted.
+- Recipient **order** is normalized (case-insensitively sorted) before signing and before comparison,
+  so re-listing the same recipient _set_ in a different order never causes a spurious mismatch; adding,
+  removing, or moving an address between `to` and `cc` always does.
+- The secret is provisioned by `scripts/configure-send-signing.sh`, never run automatically. Without
+  it, `mail_send_preview` issues no receipt at all (and says so in `reasons`); a live `mail_send` call
+  with no receipt, or a receipt that fails any check, is rejected (`outcome: "rejected"`) — this is on
+  top of, not instead of, the unconditional live-send feature gate below.
+
+## Live SMTP submission is feature-gated off
+
+Exactly the same shape as "Why permanent delete is feature-gated off" above, applied to `mail_send`.
+Consent gating (`dryRun`/`confirm`/`acknowledgeExternalSend`), full intent validation, and full
+`sendIntentReceipt` verification are all implemented and unit-tested for real in 0.5.0 — but a
+fully-confirmed live call, with a valid receipt matching the exact payload, is still refused
+unconditionally, before any SMTP connection is attempted:
+
+```json
+{ "blocked": true, "blockReason": "liveSendDisabled" }
+```
+
+`src/smtp/transport.ts`'s `submitSmtp` — the one function in this project that may ever open a real
+SMTP connection — is implemented and unit-tested against controlled fakes (never a real socket, see
+`tests/smtp-transport.test.ts`), but is **not called anywhere** from `mail_send`'s registered tool
+path in 0.5.0, mirroring `expungeExactUids`'s relationship to `mail_delete_permanently` exactly. Live
+send ships in a separate, explicitly authorized version after dedicated live validation against a
+real Bridge instance — not in this task.
+
+## Duplicate sends are worse than an uncertain result
+
+Once the gate above is eventually lifted, the transport layer (`src/smtp/outcome.ts`) is built around
+one rule this project will not compromise on: an SMTP failure with no definitive server response is
+classified `uncertain` (with `deliveryUncertain: true`), never silently treated as either a clean
+success or a clean failure — and **nothing in this codebase retries an SMTP submission
+automatically**, on any outcome, ever. A 4xx "temporary failure" response explicitly invites a retry;
+this project reports it as `uncertain` instead of retrying, for the same reason. Sending the same
+message twice because a response was ambiguous is a strictly worse failure mode than returning
+"I don't know" and letting the caller decide — see `tests/smtp-outcome.test.ts` and
+`tests/smtp-transport.test.ts` ("never retries automatically").
+
+## Sent-folder placement is not modeled yet
+
+0.5.0 does not perform a manual IMAP `APPEND` into Sent after an SMTP submission, and does not yet
+know whether/how Proton Bridge places a locally-submitted message into Sent on its own. Guessing here
+risks a duplicate copy (SMTP submission _and_ a manual append) worse than not modeling it at all. The
+result shape reserves `sentFolderObserved` (always `null` in 0.5.0) for a future, explicitly live-validated
+version to fill in once that behavior has actually been observed against a real Bridge instance — not
+invented in advance.
+
 ## Reporting
 
-This is a personal, local-only project whose only network-facing surface beyond `127.0.0.1` is the single,
-heavily-restricted outbound HTTPS request `mail_unsubscribe` may make — see "External HTTP side effect"
-above. If you
+This is a personal, local-only project whose only network-facing surface beyond `127.0.0.1` is a small,
+heavily-restricted set: the single outbound HTTPS request `mail_unsubscribe` may make (see "External HTTP
+side effect" above), and — as of 0.5.0 — the loopback-only SMTP connection `mail_send` would make once its
+feature gate is lifted (currently unreachable; see "Live SMTP submission is feature-gated off"). If you
 fork or extend it and find a security issue, treat it with the same care as the points above:
 prefer removing a footgun over rationalizing it.

@@ -15,6 +15,8 @@ import { registerMoveTool } from '../src/tools/move.js';
 import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
 import { registerRestoreFromTrashTool } from '../src/tools/restore-from-trash.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
+import { registerSendPreviewTool } from '../src/tools/send-preview.js';
+import { registerSendTool } from '../src/tools/send.js';
 import { registerTrashTool } from '../src/tools/trash.js';
 import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from '../src/tools/unsubscribe-preview.js';
@@ -97,6 +99,15 @@ const EXPECTED_READ_ONLY_NAMES = [
   'mail_unsubscribe_preview',
 ];
 
+// V5 (0.5.0, "SMTP Send Foundation"): mail_send_preview is read-only (zero
+// SMTP connections); mail_send is not read-only but is deliberately NOT
+// destructiveHint — sending mail doesn't destroy/mutate existing mailbox
+// state, it's an external side effect (same MCP-semantics reasoning as
+// mail_restore_from_trash). Live submission is unconditionally feature-gated
+// off in 0.5.0 — see src/smtp/send.ts.
+const smtpRegistrars = [registerSendPreviewTool, registerSendTool];
+const EXPECTED_SMTP_NAMES = ['mail_send', 'mail_send_preview'];
+
 const EXPECTED_MUTATION_NAMES = [
   'mail_apply_label',
   'mail_archive',
@@ -120,11 +131,16 @@ const DESTRUCTIVE_HINT_EXPECTED = new Set(['mail_mark_spam', 'mail_unsubscribe']
 // mail_trash, mail_restore_from_trash, and mail_delete_permanently are now
 // supported, but ONLY through their own narrow, heavily-gated paths — see
 // the "V4 — Safe Trash Lifecycle" tests below, which pin down the EXACT set
-// of delete/trash-named tools allowed to exist. "expunge" stays banned
-// outright: no tool in this project is ever named after the raw IMAP
-// command, ideally or in a gated form.
+// of delete/trash-named tools allowed to exist. "send" was removed in 0.5.0
+// for the same reason — mail_send / mail_send_preview now exist, but ONLY
+// through their own narrow, plain-text-only, receipt-gated, feature-gated
+// path — see the "V5 — SMTP Send Foundation" tests below, which pin down the
+// EXACT set of send-named tools allowed to exist. "expunge", a bare "smtp"
+// prefix, "reply", and "forward" stay banned outright: no tool in this
+// project is ever named after the raw IMAP command, a generic SMTP verb, or
+// reply/forward (0.5.1 scope, not built yet), ideally or in a gated form.
 const BANNED_NAME_PATTERN =
-  /^mail_(expunge|smtp|send(?:_|$)|reply|forward|block[_-]?list|allow[_-]?list|draft.?send)/i;
+  /^mail_(expunge|smtp|reply|forward|block[_-]?list|allow[_-]?list|draft.?send)/i;
 
 describe('V1 read-only tool registration', () => {
   it('registers exactly the five documented read-only tool names', () => {
@@ -203,20 +219,42 @@ describe('V4 — Safe Trash Lifecycle tool registration', () => {
   });
 });
 
+describe('V5 — SMTP Send Foundation tool registration', () => {
+  it('registers exactly the two documented SMTP tool names', () => {
+    const names = smtpRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    expect(names.sort()).toEqual(EXPECTED_SMTP_NAMES);
+  });
+
+  it('mail_send_preview is read-only and non-destructive', () => {
+    const [registration] = captureRegistrations(registerSendPreviewTool);
+    expect(registration?.config.annotations?.readOnlyHint).toBe(true);
+    expect(registration?.config.annotations?.destructiveHint).toBe(false);
+  });
+
+  it('mail_send is NOT read-only but is deliberately NOT destructiveHint either', () => {
+    const [registration] = captureRegistrations(registerSendTool);
+    expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+    expect(registration?.config.annotations?.destructiveHint).toBe(false);
+  });
+});
+
 describe('the full tool surface', () => {
   const allRegistrars = [
     ...readOnlyRegistrars,
     ...mutationRegistrars,
     registerTriageIntelligenceTools,
     ...trashLifecycleRegistrars,
+    ...smtpRegistrars,
   ];
 
-  it('is exactly 23 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3)', () => {
+  it('is exactly 25 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3) + V5 (2)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(23);
-    expect(new Set(names).size).toBe(23); // no accidental duplicate names
+    expect(names).toHaveLength(25);
+    expect(new Set(names).size).toBe(25); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {
@@ -226,18 +264,21 @@ describe('the full tool surface', () => {
     }
   });
 
-  it('has no SMTP, send, reply, or forward tool registered anywhere', () => {
+  it('has no bare-SMTP, reply, or forward tool registered anywhere (0.5.1 scope, not built yet)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    for (const forbidden of [
-      /^mail_smtp/i,
-      /^mail_send(?:_|$)/i,
-      /^mail_reply/i,
-      /^mail_forward/i,
-    ]) {
+    for (const forbidden of [/^mail_smtp/i, /^mail_reply/i, /^mail_forward/i]) {
       expect(names.some((name) => forbidden.test(name))).toBe(false);
     }
+  });
+
+  it('the only send-named tools are the two documented V5 tools', () => {
+    const names = allRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    const sendNamed = names.filter((name) => /^mail_send(?:_|$)/i.test(name));
+    expect(sendNamed.sort()).toEqual(EXPECTED_SMTP_NAMES);
   });
 
   it('has no expunge tool registered anywhere', () => {

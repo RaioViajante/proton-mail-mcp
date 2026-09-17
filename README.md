@@ -55,10 +55,10 @@ See [SECURITY.md](SECURITY.md) for the condensed version of these rules.
 ```
 src/
   index.ts              # process entry point; starts the server over stdio
-  server.ts              # builds the McpServer and registers all 23 tools
+  server.ts              # builds the McpServer and registers all 25 tools
   bridge/
     client.ts            # opens/closes a Bridge IMAP connection
-    config.ts            # non-secret config file + macOS Keychain password lookup
+    config.ts            # non-secret config file + macOS Keychain password/secret lookups (IMAP + SMTP)
   mail/                   # V1 read-only operations
     folders.ts            # IMAP LIST
     messages.ts            # list/get messages; MIME parsing via postal-mime
@@ -85,6 +85,15 @@ src/
     http-client.ts              # the one outbound HTTPS POST this project ever makes
     preview.ts                    # mail_unsubscribe_preview's core (zero network calls)
     execute.ts                     # mail_unsubscribe's core (consent gates + pre-send revalidation)
+  smtp/                      # V5 (0.5.0) — see "V5 — SMTP Send Foundation"
+    host-safety.ts            # loopback-only SMTP host validation (structural + DNS-pinned)
+    config.ts                  # SMTP non-secret config schema + resolved-config shape
+    policy.ts                   # sender/recipient/subject/body validation + normalization
+    intent.ts                    # builds the normalized SendIntent (+ body hash) preview/send/receipt share
+    outcome.ts                    # pure classification of an SMTP attempt into the conservative result model
+    transport.ts                   # nodemailer transport + submitSmtp — implemented, not called live in 0.5.0
+    preview.ts                      # mail_send_preview's core (zero SMTP connections)
+    send.ts                          # mail_send's core (consent gates + receipt check + live feature gate)
   tools/
     list-folders.ts, list-messages.ts, search-mail.ts, get-message.ts,      # V1
     unsubscribe-preview.ts                                                  # V1 (read-only)
@@ -92,13 +101,17 @@ src/
     mark-spam.ts, apply-label.ts, remove-label.ts, create-folder.ts, create-label.ts,
     unsubscribe.ts                                                         # V3 (mutation)
     trash.ts, restore-from-trash.ts, delete-permanently.ts                  # V4 (0.4.0)
+    send-preview.ts, send.ts                                                # V5 (0.5.0)
   security/
-    untrusted-content.ts  # labels + bounds any text pulled from an email
+    untrusted-content.ts       # labels + bounds any text pulled from an email
+    restore-receipt.ts          # V4 (0.4.2): signed pre-Trash snapshot receipts
+    send-intent-receipt.ts       # V5 (0.5.0): signed preview->send intent receipts
 
-tests/                    # Vitest; no live IMAP connection, no live HTTP to a real mailing list, see "Development commands"
+tests/                    # Vitest; no live IMAP connection, no live HTTP to a real mailing list, no live SMTP, see "Development commands"
 scripts/
-  configure-bridge.sh              # one-time manual setup: Keychain + non-secret config
+  configure-bridge.sh              # one-time manual setup: Keychain + non-secret config (IMAP + SMTP, 0.5.0)
   configure-receipt-signing.sh     # optional (0.4.2): provisions the restore-receipt HMAC signing secret
+  configure-send-signing.sh        # optional (0.5.0): provisions the send-intent-receipt HMAC signing secret
 ```
 
 Each tool call opens a fresh IMAP connection, does its work, and closes the connection — there is no
@@ -183,14 +196,19 @@ recovery codes, or 2FA tokens. You sign in to Bridge yourself, manually, outside
 `scripts/configure-bridge.sh` is a manual, interactive script. Run it yourself — it is never run
 automatically. It:
 
-1. Asks for the Bridge IMAP **username**, **host** (default `127.0.0.1`), **port** (default `1143`), and the
-   path to the exported TLS certificate — all non-secret — and writes them to
-   `~/.config/proton-mail-mcp/config.json` (mode `600`, in a `700` directory).
-2. Asks for the Bridge IMAP **password** with hidden input (`read -s`) and stores **only that value** in the
-   macOS Keychain, under service `proton-mail-mcp`, account = your Bridge username. The password is never
-   echoed, never written to any file, and never appears in shell history (it is captured into a shell
-   variable by `read -s`, not typed as a literal command-line argument).
-3. Verifies the password can be read back, then unsets the shell variable.
+1. Asks for the Bridge IMAP **username**, **host** (default `127.0.0.1`), **port** (default `1143`), the
+   path to the exported TLS certificate, and — as of 0.5.0 — the Bridge **SMTP port** (default `1025`) and
+   **connection mode** (`starttls` or `tls`; there is no plaintext option) — all non-secret.
+2. Asks for the Bridge **password** (shared by IMAP and SMTP — Bridge issues one credential pair) with
+   hidden input (`read -s`) and stores **only that value** in the macOS Keychain, under service
+   `proton-mail-mcp`, account = your Bridge username. The password is never echoed, never written to any
+   file, and never appears in shell history (it is captured into a shell variable by `read -s`, not typed
+   as a literal command-line argument).
+3. **Stores and verifies the password in the Keychain first, then writes `config.json`** — atomically, via
+   a temp file in the same directory validated (structurally, with `node -e`) and then renamed into place.
+   This ordering and the atomic write are deliberate (0.5.0): previously, `config.json` could theoretically
+   end up written before the credential it describes was confirmed to actually work. A crash or interrupt
+   at any point up to the final rename now leaves any pre-existing `config.json` completely untouched.
 
 At runtime, the server retrieves the password by shelling out to the same Keychain lookup used by the
 script:
@@ -206,7 +224,16 @@ security find-generic-password -a "<bridge-username>" -s "proton-mail-mcp"   # m
 security delete-generic-password -a "<bridge-username>" -s "proton-mail-mcp"
 ```
 
-Re-run `scripts/configure-bridge.sh` any time you regenerate the Bridge password or change the port.
+Re-run `scripts/configure-bridge.sh` any time you regenerate the Bridge password, change a port, or (if you
+set this project up before 0.5.0) to add SMTP settings to an existing install — it never generates a new
+Bridge password and never asks for your Proton Account password.
+
+`scripts/configure-send-signing.sh` (0.5.0) is a separate, also-manual script: it generates and stores this
+machine's `mail_send_preview` / `mail_send` receipt-signing secret (Keychain service
+`proton-mail-mcp-send-signing`), the same way `scripts/configure-receipt-signing.sh` does for restore
+receipts. Not run automatically by this task or by anything else — see SECURITY.md ("Send-intent
+receipts"). Without it, `mail_send_preview` simply issues no receipt (and says so); live `mail_send` is
+unconditionally disabled in 0.5.0 regardless.
 
 ## TLS certificate setup
 
@@ -1090,6 +1117,114 @@ membership, by checking Message-ID correlation against every `Labels/<name>` mai
 stays stateless, exactly like every other tool here; every label/flag-impact result is recomputed fresh from
 live IMAP state on each call.
 
+## V5 — SMTP Send Foundation (0.5.0)
+
+Two new tools — this project's first-ever SMTP capability. Deliberately minimal scope: plain-text
+only, no reply/forward (0.5.1, built on top of this transport later), no attachments, sender locked
+to the configured Bridge identity, and **live submission is unconditionally disabled** pending
+dedicated live validation, exactly like `mail_delete_permanently`'s gate.
+
+### Feature matrix
+
+| Capability                           | Status                                                                 |
+| ------------------------------------ | ---------------------------------------------------------------------- |
+| Preview a send (`mail_send_preview`) | Supported — zero SMTP connections, validates/normalizes/signs only     |
+| Send — dry-run                       | Supported — validates the intent and receipt, no SMTP connection       |
+| Send — live                          | **Disabled**, unconditionally, pending a separate live-validation task |
+
+### Why an SMTP capability, and why so narrow
+
+The goal of 0.5.0 is to prove a safe SMTP transport exists and is wired correctly end to end —
+config, secret handling, TLS, sender/recipient/body policy, a signed intent receipt, consent gating —
+without yet trusting it to actually deliver mail. Reply/forward would need to derive `To`/`Subject`/
+threading headers from a read message (a much larger, attacker-influenced surface — see "Threat model"
+below) and are deferred to 0.5.1, built on top of the transport this version establishes.
+
+### SMTP host (`src/smtp/host-safety.ts`, `src/smtp/config.ts`)
+
+Loopback-only, enforced twice (config schema + transport construction) — see SECURITY.md ("SMTP host
+is loopback-only") for the full rule and why. Bridge's SMTP and IMAP servers share one account/credential;
+only the port and connection mode (`starttls` | `tls`, no plaintext option exists) differ, configured via
+`scripts/configure-bridge.sh` (updated in 0.5.0) into the same `config.json`'s new `smtp` key — optional,
+so a pre-0.5.0 config with no `smtp` key still loads exactly as it did in 0.4.2 for every IMAP-only tool.
+
+### `mail_send_preview` (`readOnlyHint: true`)
+
+Validates and normalizes exactly what `mail_send` would submit and reports eligibility. **Makes zero
+SMTP connections** — eligibility means "this intent is well-formed and authorized", never "the Bridge
+SMTP server is currently reachable". When eligible and a send-signing secret is provisioned
+(`scripts/configure-send-signing.sh`, not run automatically), issues an opaque, signed
+`sendIntentReceipt` — see "Send-intent receipts" below. Returns:
+
+```json
+{
+  "operation": "mail_send_preview",
+  "from": "you@proton.me",
+  "to": ["a@example.com"],
+  "cc": [],
+  "subject": "Hi",
+  "bodyLength": 11,
+  "bodyDigest": "a1b2c3...",
+  "totalRecipients": 1,
+  "smtpHost": "127.0.0.1",
+  "smtpPort": 1025,
+  "securityMode": "starttls",
+  "eligible": true,
+  "reasons": [],
+  "sendIntentReceipt": { "...": "opaque — pass back to mail_send unmodified" }
+}
+```
+
+### `mail_send` (`readOnlyHint: false`, `destructiveHint: false`)
+
+Submits a plain-text email over SMTP — an external side effect once live, not a destructive mutation
+of existing mailbox state, so `destructiveHint` stays `false` (the description itself is the warning,
+same MCP-semantics reasoning `mail_restore_from_trash` already uses). Defaults to `dryRun: true`; live
+execution requires `confirm: true`, `acknowledgeExternalSend: true`, **and** a valid `sendIntentReceipt`
+matching the exact payload — but even then, live submission is refused unconditionally:
+
+```json
+{ "blocked": true, "blockReason": "liveSendDisabled" }
+```
+
+See SECURITY.md ("Live SMTP submission is feature-gated off").
+
+### Send-intent receipts (`src/security/send-intent-receipt.ts`)
+
+The same fix `restoreReceipt` applies to the Trash/restore round-trip, applied to the preview/send
+round-trip: without a receipt, nothing ties a validated preview to what `mail_send` actually submits.
+`mail_send_preview` signs the normalized intent (from/to/cc/subject/body-hash, never the body itself)
+with a per-install secret (Keychain service `proton-mail-mcp-send-signing`, distinct from the Bridge
+password and the restore-receipt secret); `mail_send` verifies structure, signature, a 15-minute
+expiry, and an exact field-for-field match before ever proceeding. Recipient _order_ is normalized
+before signing, so re-listing the same set differently between calls never causes a false mismatch —
+adding, removing, or moving an address between `to`/`cc` always does. See SECURITY.md ("Send-intent
+receipts") for the full design.
+
+### Sender, recipient, subject, body policy
+
+See SECURITY.md ("Sender identity is never caller-chosen", "Recipient, subject, and body policy") for
+the full rules: `From` locked to the configured Bridge identity, recipients capped at 5 total between
+`to`/`cc`, no Bcc, CR/LF and other control characters rejected outright in every address/subject field
+(the concrete header-injection defense), body plain-text/UTF-8/bounded and never interpreted as
+anything but literal content.
+
+### Result model and SMTP uncertainty
+
+`mail_send`'s live result (once the gate is eventually lifted) never claims "delivered" — SMTP
+acceptance isn't proof of final delivery. Outcomes are `accepted` / `partiallyAccepted` / `rejected` /
+`uncertain` / `failed` / `blocked`; a definitive server response (a numeric SMTP code) drives
+`accepted`/`rejected`, while any ambiguous failure — a dropped connection, a timeout mid-submission —
+is `uncertain` with `deliveryUncertain: true`, and is **never retried automatically** by anything in
+this codebase. See SECURITY.md ("Duplicate sends are worse than an uncertain result").
+
+### Sent-folder placement is not modeled yet
+
+0.5.0 does not manually `APPEND` a sent message into Sent, and does not yet know how Bridge itself
+places (or doesn't place) a submitted message there. `sentFolderObserved` is reserved (always `null`
+in 0.5.0) for a future live-validated version to fill in once that behavior has actually been
+observed — see SECURITY.md.
+
 ## Threat model (prompt injection via email)
 
 Email is attacker-controlled input. Anyone who can send you mail can put arbitrary text — including text
@@ -1118,16 +1253,23 @@ This server's defenses:
    `confirm: true`, `acknowledgePermanentDeletion: true`, AND `confirmationPhrase` exactly
    `"DELETE PERMANENTLY"` — and even then, live execution is unconditionally refused by a feature gate. See
    ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
+   `mail_send` (0.5.0) requires `dryRun: false`, `confirm: true`, `acknowledgeExternalSend: true`, AND a
+   valid `sendIntentReceipt` matching the exact payload — and even then, live execution is unconditionally
+   refused by a feature gate. See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
 4. **No raw HTML, bounded size.** HTML-only messages are converted to inert plain text before being returned,
    and bodies are capped at 20,000 characters.
 5. **`List-Unsubscribe` is treated as hostile input, structurally.** `mail_unsubscribe` never reads the
    message body to decide a network destination, only the standardized `List-Unsubscribe`/
    `List-Unsubscribe-Post` headers, and every candidate URL passes the SSRF defenses in ["V3 — Controlled
    Unsubscribe"](#v3--controlled-unsubscribe-030) before a single byte is sent.
+6. **`mail_send` never derives anything from email content.** `from`/`to`/`cc`/`subject`/`text` are explicit
+   caller-supplied inputs only, never parsed out of a read message — there is no "reply" or "forward" tool in
+   0.5.0 that could turn an attacker-controlled `Reply-To` or body text into a send target. See
+   ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050) and SECURITY.md.
 
-If you extend this project with any tool that takes a broader action (a search-based mutation, sending mail,
-browser automation), treat every value derived from email content as hostile input to that action, and
-re-read this section first.
+If you extend this project with any tool that takes a broader action (a search-based mutation, browser
+automation, or reply/forward built on top of the 0.5.0 SMTP transport), treat every value derived from email
+content as hostile input to that action, and re-read this section first.
 
 ## Claude Code integration
 
@@ -1145,7 +1287,7 @@ claude mcp add --scope user proton-mail node /path/to/proton-mail-mcp/dist/index
   restrictive `--scope local` (private to you, scoped to the current project directory) works too.
 - No `-e` / environment variables and no header/token flags — there is nothing secret to pass.
 
-Verify it's registered, connects, and exposes all 23 tools:
+Verify it's registered, connects, and exposes all 25 tools:
 
 ```
 claude mcp list

@@ -22,7 +22,8 @@ export interface PermanentDeleteResult extends MutationResult {
   /**
    * True only when a fully-confirmed live call (`dryRun: false`, `confirm`,
    * `acknowledgePermanentDeletion`, and the exact `confirmationPhrase` all
-   * correct) was refused anyway by the 0.4.0 feature gate. Never true for a
+   * correct) was refused anyway by the feature gate (introduced 0.4.0,
+   * unchanged as of 0.4.2). Never true for a
    * dry-run — there is nothing to gate on a preview.
    */
   blocked?: boolean;
@@ -30,14 +31,14 @@ export interface PermanentDeleteResult extends MutationResult {
 }
 
 /**
- * `mail_delete_permanently` core (0.4.0): implemented and fully testable —
+ * `mail_delete_permanently` core (introduced 0.4.0, gate still active as of 0.4.2): implemented and fully testable —
  * schema validation, batch limits, the two-confirmation-plus-phrase gate,
  * and read-only Trash resolution all run for real — but a fully-confirmed
  * live call is refused by a hard feature gate before any IMAP mutating
  * command is even considered. See `expungeExactUids` below for the
  * UID-scoped deletion primitive this will call once a future, separately
  * authorized version lifts the gate, and SECURITY.md ("Permanent delete is
- * feature-gated off in 0.4.0") for why.
+ * feature-gated off") for why.
  *
  * Validation order matters and is deliberate: batch size and the
  * confirm/acknowledge/phrase gate are pure input checks that reject before
@@ -108,7 +109,7 @@ export async function deletePermanently(
     return result;
   }
 
-  // V0.4.0 feature gate: every confirmation above was correct, but live
+  // Feature gate (introduced 0.4.0, unchanged as of 0.4.2): every confirmation above was correct, but live
   // execution is refused unconditionally before any IMAP mutating command —
   // no messageFlagsAdd, no messageDelete, no EXPUNGE of any kind. Live
   // permanent deletion ships in a separate, explicitly authorized version.
@@ -119,7 +120,7 @@ export async function deletePermanently(
 
 /**
  * The one function in this project that may ever issue a permanent
- * deletion. **Not called anywhere in 0.4.0** — `deletePermanently` above
+ * deletion. **Not called anywhere as of 0.4.2** — `deletePermanently` above
  * refuses before reaching this — but implemented and unit-tested now so a
  * future version's gate removal has a structurally-safe primitive ready,
  * per SECURITY.md's UID-scoped-only rule.

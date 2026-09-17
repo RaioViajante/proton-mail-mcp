@@ -140,3 +140,92 @@ describe('getBridgePassword', () => {
     }
   });
 });
+
+describe('getReceiptSigningSecret / getReceiptSigningSecretOrUndefined', () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+  });
+
+  const VALID_HEX = 'a'.repeat(64);
+
+  it('retrieves and hex-decodes the secret from the Keychain via `security find-generic-password`', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(null, { stdout: `${VALID_HEX}\n`, stderr: '' });
+    });
+    const {
+      getReceiptSigningSecret,
+      RECEIPT_SIGNING_KEYCHAIN_SERVICE,
+      RECEIPT_SIGNING_KEYCHAIN_ACCOUNT,
+    } = await import('../src/bridge/config.js');
+    const secret = await getReceiptSigningSecret();
+    expect(secret).toEqual(Buffer.from(VALID_HEX, 'hex'));
+    expect(secret.length).toBe(32);
+
+    const call = execFileMock.mock.calls[0];
+    expect(call?.[1]).toEqual([
+      'find-generic-password',
+      '-a',
+      RECEIPT_SIGNING_KEYCHAIN_ACCOUNT,
+      '-s',
+      RECEIPT_SIGNING_KEYCHAIN_SERVICE,
+      '-w',
+    ]);
+  });
+
+  it('uses a Keychain service distinct from the Bridge password', async () => {
+    const { RECEIPT_SIGNING_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE } =
+      await import('../src/bridge/config.js');
+    expect(RECEIPT_SIGNING_KEYCHAIN_SERVICE).not.toBe(KEYCHAIN_SERVICE);
+  });
+
+  it('throws a clear, actionable error when the Keychain item is missing', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(new Error('security: SecKeychainSearchCopyNext: item not found'), {
+        stdout: '',
+        stderr: '',
+      });
+    });
+    const { getReceiptSigningSecret } = await import('../src/bridge/config.js');
+    await expect(getReceiptSigningSecret()).rejects.toThrow(/configure-receipt-signing\.sh/);
+  });
+
+  it('throws when the stored value is not 32 bytes of hex', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(null, { stdout: 'not-hex-at-all\n', stderr: '' });
+    });
+    const { getReceiptSigningSecret } = await import('../src/bridge/config.js');
+    await expect(getReceiptSigningSecret()).rejects.toThrow(/not a 32-byte hex value/);
+  });
+
+  it('never lets the secret value leak into a thrown error message', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(new Error(`unexpected failure near value ${VALID_HEX}`), { stdout: '', stderr: '' });
+    });
+    const { getReceiptSigningSecret } = await import('../src/bridge/config.js');
+    try {
+      await getReceiptSigningSecret();
+      expect.unreachable('expected getReceiptSigningSecret to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).not.toContain(VALID_HEX);
+    }
+  });
+
+  it('getReceiptSigningSecretOrUndefined resolves to undefined instead of throwing when unprovisioned', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(new Error('not found'), { stdout: '', stderr: '' });
+    });
+    const { getReceiptSigningSecretOrUndefined } = await import('../src/bridge/config.js');
+    await expect(getReceiptSigningSecretOrUndefined()).resolves.toBeUndefined();
+  });
+
+  it('getReceiptSigningSecretOrUndefined resolves to the secret when provisioned', async () => {
+    execFileMock.mockImplementation((_cmd, _args, callback) => {
+      callback(null, { stdout: `${VALID_HEX}\n`, stderr: '' });
+    });
+    const { getReceiptSigningSecretOrUndefined } = await import('../src/bridge/config.js');
+    await expect(getReceiptSigningSecretOrUndefined()).resolves.toEqual(
+      Buffer.from(VALID_HEX, 'hex'),
+    );
+  });
+});

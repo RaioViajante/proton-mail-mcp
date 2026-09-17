@@ -25,8 +25,8 @@ export const inputSchema = z.object({
     .default(true)
     .describe(
       'When true (default), resolves and previews which UIDs exist in Trash without deleting ' +
-        'anything. Live execution (dryRun=false) is unconditionally disabled in 0.4.0 — see the ' +
-        'tool description.',
+        'anything. Live execution (dryRun=false) is unconditionally disabled (introduced 0.4.0, ' +
+        'unchanged as of 0.4.2) — see the tool description.',
     ),
   confirm: z.boolean().default(false).describe('Must be true when dryRun=false.'),
   acknowledgePermanentDeletion: z
@@ -43,7 +43,7 @@ export function registerDeletePermanentlyTool(server: McpServer): void {
   server.registerTool(
     'mail_delete_permanently',
     {
-      title: 'Permanently delete mail (live-disabled in 0.4.0)',
+      title: 'Permanently delete mail (live-disabled)',
       description:
         'Permanently deletes explicit message UIDs from Trash — irreversible, and the most ' +
         'dangerous operation in this project. Defaults to dryRun=true, which only resolves and ' +
@@ -51,8 +51,9 @@ export function registerDeletePermanentlyTool(server: McpServer): void {
         "dry-run. sourceFolder must be exactly the account's Trash folder. Live execution " +
         '(dryRun=false) requires confirm=true, acknowledgePermanentDeletion=true, AND ' +
         `confirmationPhrase exactly "${PERMANENT_DELETE_CONFIRMATION_PHRASE}" — but even with every ` +
-        'confirmation correct, live execution is UNCONDITIONALLY DISABLED in 0.4.0 by a hard ' +
-        'feature gate: the call returns blocked: true, blockReason: "livePermanentDeleteDisabled", ' +
+        'confirmation correct, live execution is UNCONDITIONALLY DISABLED by a hard feature gate ' +
+        '(introduced 0.4.0, unchanged as of 0.4.2): the call returns blocked: true, blockReason: ' +
+        '"livePermanentDeleteDisabled", ' +
         'before any IMAP mutating command is issued. This is a deliberate, documented limitation, ' +
         'not a bug — live permanent deletion ships in a separate, explicitly authorized version ' +
         'after dedicated destructive-action validation. See SECURITY.md.',

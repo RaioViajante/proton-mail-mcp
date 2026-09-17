@@ -66,7 +66,7 @@ mutating ImapFlow method and on every lock's `readOnly` flag).
 V4 (0.4.0) adds `mail_trash` and `mail_restore_from_trash` — both MOVE-based, following exactly this same
 model (explicit UIDs, `dryRun: true` default, confirm/acknowledge gate before any write-mode lock) — and
 `mail_delete_permanently`, which is implemented and fully unit-tested but whose live execution is refused
-unconditionally; see "Permanent delete is feature-gated off in 0.4.0" below. If a future version adds any
+unconditionally; see "Permanent delete is feature-gated off" below. If a future version adds any
 further mutating capability, it must follow the same model, and be documented here and in README.md's "V2
 mutation limitations" before it ships.
 
@@ -281,7 +281,123 @@ recomputed fresh from live IMAP state on each call, exactly like every other too
 specific message used in the live validation is recorded anywhere in this repository; only the structural
 bug and the fix are.
 
-## Why permanent delete is feature-gated off in 0.4.0
+## Restore receipts: why Trash is not an authoritative source, and how 0.4.2 fixes it
+
+**The TOCTOU this addresses.** A second live validation — specifically designed to check 0.4.1's fix — found
+it insufficient. `mail_trash`'s own immediate post-move check reported a message's two labels intact in
+Trash. Sometime after that call returned, **asynchronously**, Proton Bridge dropped both labels while the
+message sat in Trash — outside any window this project's own code executes in. A later
+`mail_restore_from_trash` call measured Trash's "before" state as its repair baseline (0.4.1's entire
+mechanism) and found zero labels — because they were already gone by then. 0.4.1 had nothing to reapply, and
+reported a clean result while two labels were permanently lost. This is a time-of-check-to-time-of-use
+problem across two separate tool calls, potentially minutes or longer apart, with no code of this project's
+running in between to observe the loss happening.
+
+**Why Trash can never be fully authoritative for this.** No read-only measurement taken _at restore time_ can
+recover information that was already lost _before_ restore time began, no matter how carefully it's
+implemented. The only way to have a trustworthy "original state" baseline is to capture it earlier — at
+`mail_trash` time, before any possible async decay — and carry it forward.
+
+**The fix: a signed, stateless restore receipt.** `mail_trash` optionally issues one per identity-confirmed,
+live-moved UID (`src/security/restore-receipt.ts`), built from the pre-move snapshot it already captures
+(`originalLabels`/`originalFlags` — never from `labelsAfterTrash`/`flagsAfterTrash`). The caller carries it to
+`mail_restore_from_trash`, which — after full verification — treats it as authoritative in place of Trash's
+current state.
+
+**Statelessness preserved.** This project still keeps no server-side history of trashed messages. The receipt
+is the caller's responsibility to hold between the two calls; the server that issued it does not remember it
+existed. This is safe specifically because the receipt is authenticated end-to-end (next point) — a caller
+(or a model relaying tool output) cannot fabricate or silently alter one without detection. We evaluated
+adding a local persistence layer (a small on-disk "pending trash operations" store) as an alternative and
+rejected it: it would reintroduce exactly the kind of server-side mailbox history this project has
+deliberately avoided since 0.4.0, for a benefit (surviving a caller that discards the receipt) that a
+clearly-documented, fail-closed "no receipt -> weaker fallback" behavior already covers without it.
+
+**Identity binding — no raw Message-ID, ever.** A receipt is bound to one specific message via `identity`: a
+**keyed** HMAC-SHA256 fingerprint of that message's `Message-ID` header, derived with a subkey used for no
+other purpose. It is not a bare `sha256(Message-ID)` hash — without the install's signing secret, `identity`
+cannot be dictionary-attacked or correlated across receipts. The raw `Message-ID` itself is never included in
+a receipt, never logged, and never returned by any tool in this project. `mail_restore_from_trash` re-derives
+the same fingerprint from the _live_ Trash message's current `Message-ID` and compares it, constant-time,
+against the receipt's `identity` before trusting anything else in it — a receipt issued for message A can
+never be used to repair message B; see `tests/mutations-restore-receipt.test.ts` ("receipt for message A used
+on message B").
+
+**Tampering / integrity model.** Every receipt field is covered by an HMAC-SHA256 signature (`signature`),
+computed with a second subkey, domain-separated from the identity subkey, both derived from one per-install
+secret via a minimal HKDF-like construction (`node:crypto` only — no added dependency). Any modification to
+any field — `sourceFolder`, `originalLabels`, `originalFlags`, `identity`, `issuedAt` — invalidates the
+signature and the receipt is rejected outright (`signatureInvalid`). This matters specifically because a
+receipt is untrusted-by-default output that round-trips through the calling model: nothing about this
+project's threat model assumes a model, or anything reading a model's tool output, cannot be induced (by
+prompt injection or otherwise) to alter a JSON blob before passing it back. An unauthenticated receipt would
+let exactly that alter which labels/flags get silently reapplied to a real mailbox; a receipt that fails
+verification is fully rejected instead (`preservationSource: "unavailable"`) and **no** label or flag is
+applied from it, or from the (also-untrusted-for-this-purpose) `trashSnapshot` fallback — see "Fail-closed
+receipt rejection" below. **Security boundary this does NOT need to defend, and doesn't claim to:** a caller
+who already has the ability to invoke `mail_restore_from_trash` live (`confirm`, `acknowledge...`, and a
+verified receipt) can already choose which labels/flags to preserve — that is the tool's normal authorized
+function, identical in kind to what `labelsToRestore` already lets an authorized caller do. Receipt
+authentication exists to stop an _unauthorized modification of a specific receipt's content_ (e.g., a
+prompt-injected label swap, or reuse against the wrong message), not to add a permission model beyond what
+calling the tool already grants.
+
+**Fail-closed receipt rejection.** Any of the following rejects a supplied receipt outright, reported via
+`receiptRejections` with a stable reason code (never receipt content): malformed structure or missing field
+(`malformedReceipt`), an unsupported `v` (`malformedReceipt` — schema-level, since only version `1` is
+accepted), no signing secret available on this install (`signingSecretUnavailable`), a signature that doesn't
+verify (`signatureInvalid` — covers every tampered-field case above), no `Message-ID` on the live Trash
+message to compare against (`noMessageIdToVerify`), or an `identity` fingerprint mismatch
+(`identityMismatch`). In every case, `preservationSource` is `"unavailable"` for that UID and **neither** the
+rejected receipt **nor** a `trashSnapshot` fallback is used for repair — this project would rather visibly do
+nothing than guess. The underlying folder move (an operation the caller separately, explicitly authorized via
+`confirm`/`acknowledgeRestoreFromTrash` and the exact UID) still proceeds; only the state-preservation repair
+is withheld. See `tests/mutations-restore-receipt.test.ts` for the full matrix (malformed, missing fields,
+unsupported version, every tampered field, cross-message reuse, stale UID, receipt replay after restore, no/
+malformed Message-ID).
+
+**Scope note (documented limitation, not a security hole): receipts don't expire and can be replayed across
+multiple trash/restore cycles of the same message.** A receipt's `identity` binds it to a specific message
+(via `Message-ID`), never to a specific _trash event_ — there is no nonce or timestamp check beyond the
+informational `issuedAt`. If a message is trashed, restored, and trashed again, and the caller supplies the
+_original_ receipt for the second restore, verification still succeeds (it genuinely is the same message) and
+repairs towards that older label/flag snapshot — potentially discarding a label the user added in between the
+two trash cycles. This is a data-freshness/correctness edge case, not an unauthorized-access one: the caller
+already has to be separately authorized to call `mail_restore_from_trash` live, and the repaired state is
+still a real state that message legitimately had at some point, never a forged or cross-message one. Treat a
+receipt as valid for one specific trash/restore round-trip, not as a durable, reusable snapshot; this project
+does not enforce that usage pattern.
+
+**No body, no attachments, no Bridge credentials.** A receipt carries exactly: `v`, `sourceFolder`,
+`originalLabels` (names only — not secrets), `originalFlags` (from the fixed `\Seen`/`\Flagged` whitelist),
+`identity` (keyed fingerprint, not raw), `issuedAt`, and `signature`. It never carries message body,
+attachment content or metadata, the raw `Message-ID`, the signing secret, or the Bridge IMAP password.
+
+**Signing secret storage.** The HMAC signing secret lives only in the macOS Keychain, under a service
+(`proton-mail-mcp-receipt-signing`) **distinct** from the Bridge password's own Keychain service
+(`proton-mail-mcp`) — see `src/bridge/config.ts`. It is never the Bridge password reused as key material
+(that would tie two unrelated secrets together for no benefit, and leak receipt-signing capability to
+anything with Bridge access already), never written to `config.json`, never committed. Provisioned by
+`scripts/configure-receipt-signing.sh`, generated via `openssl rand -hex 32` (32 bytes, hex-encoded),
+following the exact same "generate locally, store in Keychain, verify readback, never echo" shape
+`scripts/configure-bridge.sh` already uses for the Bridge password.
+
+**Restart survival, deliberately.** Because the secret is Keychain-resident rather than held only in this
+server process's memory, a receipt issued before an MCP server restart is still verifiable after one — the
+whole point of a receipt is to survive an arbitrary gap between `mail_trash` and `mail_restore_from_trash`,
+and an in-process-only ephemeral key would silently defeat that for the common case of a restart in between.
+Re-running `scripts/configure-receipt-signing.sh` deliberately rotates the secret and invalidates every
+receipt issued under the old one (reported as `signatureInvalid`, fail-closed, never silently accepted) — this
+is an explicit, documented operator action, not automatic, and not something this project ever does on its
+own.
+
+**Fully additive; no upgrade required.** An install that has not run `scripts/configure-receipt-signing.sh`
+gets `signingSecret: undefined` at the tool layer; `mail_trash` then issues no `restoreReceipts` at all, and
+any receipt a caller nonetheless supplies to `mail_restore_from_trash` is rejected
+(`signingSecretUnavailable`) rather than trusted unverified. Both tools otherwise behave exactly as they did
+in 0.4.1.
+
+## Why permanent delete is feature-gated off
 
 `mail_delete_permanently` is, by a wide margin, the most dangerous operation this project has ever
 implemented — genuinely irreversible, unlike everything else here. It is fully implemented and unit-tested

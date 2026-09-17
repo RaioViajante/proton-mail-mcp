@@ -1,4 +1,10 @@
 import type { CopyResponseObject, ImapFlow } from 'imapflow';
+import {
+  deriveIdentityFingerprint,
+  RESTORE_RECEIPT_VERSION,
+  signRestoreReceipt,
+  type RestoreReceiptEnvelope,
+} from '../security/restore-receipt.js';
 import { assertBatchSize, dedupeUids } from './batch.js';
 import { fetchExistingUids } from './existence.js';
 import {
@@ -24,6 +30,25 @@ export interface TrashParams {
   dryRun: boolean;
   confirm: boolean;
   acknowledgeTrashMove: boolean;
+  /**
+   * HMAC signing secret for restore receipts (0.4.2), from
+   * `getReceiptSigningSecretOrUndefined()`. When `undefined` (no secret
+   * provisioned yet — see `scripts/configure-receipt-signing.sh`), this
+   * function behaves exactly as it did in 0.4.1: no `restoreReceipts` are
+   * issued, everything else is unchanged.
+   */
+  signingSecret?: Buffer | undefined;
+}
+
+export type ReceiptUnavailableReason =
+  'noMessageId' | 'identityNotConfirmed' | 'signingSecretUnavailable';
+
+export interface TrashReceiptOutcome {
+  uid: number;
+  /** Present only for a live move whose destination identity was confirmed and whose Message-ID was known. */
+  restoreReceipt?: RestoreReceiptEnvelope;
+  /** Present instead of `restoreReceipt` when a receipt could not be issued for this uid. */
+  receiptUnavailable?: ReceiptUnavailableReason;
 }
 
 /**
@@ -67,6 +92,18 @@ export interface TrashResult extends MutationResult {
    * clean, confirmed failure.
    */
   requiresRefresh?: boolean;
+  /**
+   * One signed restore receipt per identity-confirmed, live-moved UID
+   * (0.4.2) — present only when `signingSecret` was supplied AND this was a
+   * live call (never for a dry-run: see `src/security/restore-receipt.ts`,
+   * "Dry-run never issues a live reusable receipt"). Each receipt captures
+   * `originalLabels`/`originalFlags` from BEFORE this move — the snapshot
+   * `mail_restore_from_trash` should treat as authoritative later, since
+   * Trash's own state can decay asynchronously after this call returns. The
+   * caller is responsible for holding onto it; this server keeps no history
+   * of it.
+   */
+  restoreReceipts?: TrashReceiptOutcome[];
 }
 
 interface ResolvedMessage {
@@ -124,7 +161,7 @@ async function resolveSourceMessages(
  */
 export async function trashMessages(
   client: ImapFlow,
-  { sourceFolder, uids, dryRun, confirm, acknowledgeTrashMove }: TrashParams,
+  { sourceFolder, uids, dryRun, confirm, acknowledgeTrashMove, signingSecret }: TrashParams,
 ): Promise<TrashResult> {
   if (!dryRun && (!confirm || !acknowledgeTrashMove)) {
     throw new Error(
@@ -273,6 +310,10 @@ export async function trashMessages(
     result.changedUids.map((uid) => messageIdByUid.get(uid)),
   );
 
+  if (signingSecret) {
+    result.restoreReceipts = [];
+  }
+
   const transitions = [];
   for (const uid of result.changedUids) {
     const resultingUid = await reconcileResultingUid(
@@ -310,6 +351,33 @@ export async function trashMessages(
         flagImpact.flagsAfterTrash = fetched;
         flagImpact.flagsRemovedByTrash = flagsMissing(flagImpact.originalFlags, fetched);
         flagImpact.flagsAddedByTrash = flagsUnexpected(flagImpact.originalFlags, fetched);
+      }
+    }
+
+    // Restore receipt (0.4.2): built from the PRE-TRASH snapshot
+    // (labelImpact.originalLabels / flagImpact.originalFlags — captured
+    // before any mutation, above), never from labelsAfterTrash/
+    // flagsAfterTrash — the whole point is to survive Trash's own state
+    // decaying later, even asynchronously after this call returns. Only
+    // issued for a UID whose destination identity in Trash was actually
+    // confirmed (resultingUid !== undefined) and whose Message-ID is known
+    // — both required for mail_restore_from_trash to later prove this
+    // receipt belongs to the message it's being applied to.
+    if (signingSecret && result.restoreReceipts && labelImpact && flagImpact) {
+      if (!messageId) {
+        result.restoreReceipts.push({ uid, receiptUnavailable: 'noMessageId' });
+      } else if (resultingUid === undefined) {
+        result.restoreReceipts.push({ uid, receiptUnavailable: 'identityNotConfirmed' });
+      } else {
+        const receipt = signRestoreReceipt(signingSecret, {
+          v: RESTORE_RECEIPT_VERSION,
+          sourceFolder,
+          originalLabels: labelImpact.originalLabels,
+          originalFlags: flagImpact.originalFlags,
+          identity: deriveIdentityFingerprint(signingSecret, messageId),
+          issuedAt: new Date().toISOString(),
+        });
+        result.restoreReceipts.push({ uid, restoreReceipt: receipt });
       }
     }
   }

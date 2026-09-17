@@ -1,4 +1,8 @@
 import type { CopyResponseObject, ImapFlow } from 'imapflow';
+import {
+  type ReceiptRejectionReason,
+  validateRestoreReceipt,
+} from '../security/restore-receipt.js';
 import { assertBatchSize, dedupeUids } from './batch.js';
 import { fetchExistingUids } from './existence.js';
 import {
@@ -25,9 +29,16 @@ import { createMutationResult, type MutationResult } from './result.js';
 import { buildTransition, reconcileResultingUid } from './transitions.js';
 import { classifyUncertainMove } from './uncertain-move.js';
 
+/** Where a UID's preserved-state baseline came from (0.4.2). See module doc below. */
+export type PreservationSource = 'restoreReceipt' | 'trashSnapshot' | 'unavailable';
+
 export interface RestoreParams {
   uids: number[];
-  destinationFolder: string;
+  /**
+   * Destination folder. Required unless `restoreToOriginalSource` is used
+   * (see below), in which case it must be omitted.
+   */
+  destinationFolder?: string | undefined;
   /**
    * EXTRA labels the caller explicitly wants guaranteed on the restored
    * message, in addition to — never instead of — the labels it already
@@ -36,6 +47,32 @@ export interface RestoreParams {
    * survive a restore. See `mutations/restore.ts` module doc.
    */
   labelsToRestore?: string[] | undefined;
+  /**
+   * Signed receipts (0.4.2) from `mail_trash`'s `restoreReceipts`, keyed by
+   * the Trash-side UID they apply to. A UID with no matching entry here
+   * falls back to `trashSnapshot` preservation (0.4.1 behavior, unchanged).
+   * Each `receipt` is validated in full (structure, signature, identity)
+   * before ever being trusted — see `validateRestoreReceipt` and
+   * `receiptRejections` on the result.
+   */
+  restoreReceipts?: Array<{ uid: number; receipt: unknown }> | undefined;
+  /**
+   * HMAC signing secret for verifying receipts, from
+   * `getReceiptSigningSecretOrUndefined()`. When `undefined`, any supplied
+   * `restoreReceipts` entries are rejected (`signingSecretUnavailable`) —
+   * never silently trusted unverified.
+   */
+  signingSecret?: Buffer | undefined;
+  /**
+   * When true, ignore `destinationFolder` (must be omitted) and instead
+   * restore every matched UID to the `sourceFolder` recorded in its own
+   * verified receipt. Scope note (documented limitation, not invented
+   * behavior): only supported for a single-UID call — every matched UID
+   * would need an individually verified receipt and, if they disagreed on
+   * `sourceFolder`, an arbitrary batch-level tie-break, which this project
+   * does not implement. See `resolveDestination` below.
+   */
+  restoreToOriginalSource?: boolean | undefined;
   dryRun: boolean;
   confirm: boolean;
   acknowledgeRestoreFromTrash: boolean;
@@ -64,18 +101,65 @@ export interface RestoreFlagSnapshot {
   uid: number;
   flags: PreservableFlag[];
 }
+export interface RestorePreservationSourceEntry {
+  uid: number;
+  source: PreservationSource;
+}
+export interface RestoreStatePreservedEntry {
+  uid: number;
+  preserved: boolean;
+}
+export interface RestoreReceiptRejection {
+  uid: number;
+  reason: ReceiptRejectionReason;
+}
 
 export interface RestoreResult extends MutationResult {
   /** Alias of `changedUids`, named for this operation's own vocabulary. */
   moveRestored: number[];
-  /** Preservable flags (`\Seen`, `\Flagged`) each matched message carried in Trash, before the move. */
+  /**
+   * Where each matched UID's preserved-state baseline came from (0.4.2).
+   * `restoreReceipt` is the strong guarantee: a signed pre-Trash snapshot,
+   * verified structure/signature/identity, immune to Trash's own state
+   * decaying between `mail_trash` and this call. `trashSnapshot` is the
+   * 0.4.1 fallback — Trash's current state, measured right now, which this
+   * project does NOT treat as equivalent to the true original state (see
+   * README.md "Async label loss: why Trash is not authoritative"; a message
+   * can already have lost labels by the time this measurement happens).
+   * `unavailable` means a receipt was supplied but rejected — fail closed,
+   * meaning NEITHER the receipt NOR a trashSnapshot fallback is used for
+   * that UID's repair; see `receiptRejections` for why.
+   */
+  preservationSource: RestorePreservationSourceEntry[];
+  /**
+   * True only for a UID whose baseline was `restoreReceipt`, whose
+   * destination identity was confirmed, and whose repair had zero
+   * `labelsFailed`/`flagsFailed` entries — the full round-trip guarantee
+   * this project can actually back. A `trashSnapshot`-sourced UID is never
+   * `true` here, even with a clean repair: this project cannot prove
+   * `trashSnapshot` reflects state from before Trash, only state observed
+   * during this call.
+   */
+  statePreserved: RestoreStatePreservedEntry[];
+  /** One entry per UID whose supplied receipt failed validation. Reasons are stable codes — never receipt content. */
+  receiptRejections?: RestoreReceiptRejection[];
+  /**
+   * Preservable flags (`\Seen`, `\Flagged`) used as this restore's baseline
+   * for each matched UID — from the verified receipt when `preservationSource`
+   * is `restoreReceipt`, from Trash's current state otherwise. Absent for a
+   * UID whose `preservationSource` is `unavailable` (no trusted baseline).
+   */
   originalFlags?: RestoreFlagSnapshot[];
   /** Same flags, re-measured in the destination folder after a live move — only for a destination identity confirmed without guessing. */
   flagsAfterMove?: RestoreFlagSnapshot[];
   /** Flags automatically re-added/removed to match `originalFlags` after a divergence was detected. */
   flagsRestored?: RestoreFlagOutcome[];
   flagsFailed?: RestoreFlagFailure[];
-  /** Labels each matched message carried in Trash, before the move. */
+  /**
+   * Labels used as this restore's baseline for each matched UID — see
+   * `originalFlags` above for the same receipt-vs-trashSnapshot-vs-unavailable
+   * semantics.
+   */
   originalLabels?: RestoreLabelSnapshot[];
   /** Same labels, re-measured after a live move. */
   labelsAfterMove?: RestoreLabelSnapshot[];
@@ -219,27 +303,114 @@ async function repairFlag(
   return { restored, failed };
 }
 
+interface UidBaseline {
+  uid: number;
+  labels: string[] | undefined;
+  flags: PreservableFlag[] | undefined;
+  source: PreservationSource;
+  receiptSourceFolder: string | undefined;
+}
+
+/**
+ * Resolves each matched UID's preserved-state baseline (0.4.2) — the
+ * authoritative "what did this message look like before it was ever
+ * trashed" this restore will repair towards. Order of preference:
+ *
+ * 1. A caller-supplied receipt for this UID, IF it validates in full
+ *    (structure, signature, identity — see `validateRestoreReceipt`).
+ *    `source: 'restoreReceipt'`.
+ * 2. No receipt was supplied for this UID at all: fall back to measuring
+ *    Trash's current state, exactly as 0.4.1 always did. `source:
+ *    'trashSnapshot'` — a real measurement, just not proven to predate any
+ *    async state loss Trash may already have suffered.
+ * 3. A receipt WAS supplied but failed validation: fail closed.
+ *    `source: 'unavailable'` — neither the (untrusted) receipt nor a
+ *    trashSnapshot fallback is used; this project does not know what
+ *    "original" means for this UID, and says so rather than guessing.
+ */
+function resolveBaselines(
+  matchedUids: readonly number[],
+  receiptsByUid: ReadonlyMap<number, unknown>,
+  signingSecret: Buffer | undefined,
+  messageIdByUid: ReadonlyMap<number, string | undefined>,
+  trashLabelsByUid: ReadonlyMap<number, string[]>,
+  trashFlagsByUid: ReadonlyMap<number, PreservableFlag[]>,
+): { baselines: Map<number, UidBaseline>; rejections: RestoreReceiptRejection[] } {
+  const baselines = new Map<number, UidBaseline>();
+  const rejections: RestoreReceiptRejection[] = [];
+
+  for (const uid of matchedUids) {
+    const rawReceipt = receiptsByUid.get(uid);
+    if (rawReceipt === undefined) {
+      baselines.set(uid, {
+        uid,
+        labels: trashLabelsByUid.get(uid) ?? [],
+        flags: trashFlagsByUid.get(uid) ?? [],
+        source: 'trashSnapshot',
+        receiptSourceFolder: undefined,
+      });
+      continue;
+    }
+
+    const validation = validateRestoreReceipt(rawReceipt, signingSecret, messageIdByUid.get(uid));
+    if (!validation.valid) {
+      rejections.push({ uid, reason: validation.reason });
+      baselines.set(uid, {
+        uid,
+        labels: undefined,
+        flags: undefined,
+        source: 'unavailable',
+        receiptSourceFolder: undefined,
+      });
+      continue;
+    }
+
+    baselines.set(uid, {
+      uid,
+      labels: Array.from(new Set(validation.receipt.originalLabels)).sort(),
+      flags: validation.receipt.originalFlags,
+      source: 'restoreReceipt',
+      receiptSourceFolder: validation.receipt.sourceFolder,
+    });
+  }
+
+  return { baselines, rejections };
+}
+
 /**
  * Restores explicit UIDs from Trash into an explicit destination folder.
  *
- * ## State-preserving restore (0.4.1)
+ * ## Durable restore receipts (0.4.2)
  *
- * A live finding against 0.4.0 showed `mail_restore_from_trash` silently
- * losing state: a Trash -> Archive move dropped two labels the message had
- * carried through Trash intact, and flipped `\Seen` (unread -> read) — and
- * the tool reported a clean success throughout, because it only ever
- * measured what `labelsToRestore` explicitly asked for. This version
- * changes the contract: before any move, it snapshots each matched
- * message's preservable flags (`\Seen`, `\Flagged` — see
- * `mutations/flags.ts`) and full label membership while it's still in
- * Trash; after a live move (and only for a destination identity confirmed
- * via the same UIDPLUS-verified-then-Message-ID reconciliation every other
- * transition in this project uses — never a guess), it re-measures both and
- * automatically repairs any divergence: a label that disappeared is
+ * A live finding against 0.4.1 showed Trash itself is not an authoritative
+ * source for a message's pre-Trash state: Proton Bridge can drop labels
+ * *asynchronously*, after `mail_trash`'s own immediate post-move check
+ * already reported them intact — by the time a later `mail_restore_from_trash`
+ * call measured Trash's "before" state, the labels were already gone, and
+ * 0.4.1's automatic preservation had nothing left to restore. This version
+ * accepts back the signed `restoreReceipts` `mail_trash` issues at move
+ * time — captured before any possible async decay — and, once each one is
+ * fully verified (structure, HMAC signature, and a keyed Message-ID
+ * fingerprint match against the live Trash message — see
+ * `src/security/restore-receipt.ts`), treats it as the authoritative
+ * baseline in place of whatever Trash happens to show right now. A UID with
+ * no matching receipt falls back to 0.4.1's `trashSnapshot` behavior; a UID
+ * whose supplied receipt fails validation fails closed (`unavailable`) —
+ * see `resolveBaselines` above and `preservationSource` /
+ * `receiptRejections` on the result.
+ *
+ * ## State-preserving restore (0.4.1, retained unchanged)
+ *
+ * Before any move, this snapshots each matched message's baseline (per the
+ * above) and its currently observed Trash label membership (always, for
+ * `labelsAfterMove` diffing regardless of source); after a live move (and
+ * only for a destination identity confirmed via the same
+ * UIDPLUS-verified-then-Message-ID reconciliation every other transition in
+ * this project uses — never a guess), it re-measures both and automatically
+ * repairs any divergence from the baseline: a label that disappeared is
  * reapplied (never created), a flag that flipped is flipped back.
- * `labelsToRestore` is no longer the only way labels survive a restore — it
- * now means EXTRA labels the caller wants guaranteed, on top of automatic
- * preservation, unioned and deduplicated with it.
+ * `labelsToRestore` means EXTRA labels the caller wants guaranteed, on top
+ * of automatic preservation, unioned and deduplicated with it.
  *
  * The folder move and any repair are still separate IMAP operations, never
  * presented as atomic: a label/flag repair failure never rolls back the
@@ -256,6 +427,9 @@ export async function restoreFromTrash(
     uids,
     destinationFolder: rawDestination,
     labelsToRestore,
+    restoreReceipts,
+    signingSecret,
+    restoreToOriginalSource,
     dryRun,
     confirm,
     acknowledgeRestoreFromTrash,
@@ -271,16 +445,26 @@ export async function restoreFromTrash(
   const deduped = dedupeUids(uids);
   assertBatchSize(deduped);
 
+  if (restoreToOriginalSource) {
+    if (rawDestination !== undefined) {
+      throw new Error('destinationFolder must be omitted when restoreToOriginalSource is true.');
+    }
+    if (deduped.length !== 1) {
+      throw new Error(
+        'restoreToOriginalSource is only supported for a single UID per call (documented scope ' +
+          'limitation — see mutations/restore.ts).',
+      );
+    }
+  } else if (rawDestination === undefined) {
+    throw new Error('destinationFolder is required unless restoreToOriginalSource is true.');
+  }
+
   const folders = await client.list();
   const special = resolveSpecialFolders(folders);
   if (!special.trash) {
     throw new Error('Could not find a Trash folder on this account.');
   }
-
   const delimiter = folders[0]?.delimiter ?? '/';
-  const destinationFolder = resolveMoveDestination(special, rawDestination, delimiter);
-  assertMoveDestinationAllowed(special, destinationFolder);
-  assertFolderExists(folders, destinationFolder, 'destination folder');
 
   // labelsToRestore are EXTRAS only (0.4.1): validated to exist and rejected
   // up front, before any mutation — dry-run or live — rather than deferred
@@ -295,8 +479,22 @@ export async function restoreFromTrash(
     }
   }
 
+  // Destination resolution/validation for the normal (explicit
+  // destinationFolder) case happens here — before Trash is ever touched —
+  // exactly as it did pre-0.4.2, so a bad destination still fails fast
+  // without a wasted Trash resolution. restoreToOriginalSource defers this
+  // until a verified receipt's sourceFolder is available; see below.
+  let destinationFolder: string | undefined;
+  if (!restoreToOriginalSource) {
+    destinationFolder = resolveMoveDestination(special, rawDestination as string, delimiter);
+    assertMoveDestinationAllowed(special, destinationFolder);
+    assertFolderExists(folders, destinationFolder, 'destination folder');
+  }
+
   const result = createMutationResult('mail_restore_from_trash', dryRun, uids) as RestoreResult;
   result.moveRestored = [];
+  result.preservationSource = [];
+  result.statePreserved = [];
   if (dedupedExtras.length > 0) {
     result.labelsRequested = dedupedExtras;
   }
@@ -312,28 +510,80 @@ export async function restoreFromTrash(
 
   const labelFolders = listLabelFolders(folders, delimiter);
   const messageIdByUid = new Map(resolved.map((message) => [message.uid, message.messageId]));
-  const originalFlagsByUid = new Map(resolved.map((message) => [message.uid, message.flags]));
+  const trashFlagsByUid = new Map(resolved.map((message) => [message.uid, message.flags]));
 
   // Captured before any mutation, unconditionally (dry-run or live): what
-  // labels/flags each matched message currently carries in Trash.
+  // labels each matched message currently carries in Trash. This is always
+  // computed — it's the trashSnapshot fallback baseline AND the point of
+  // comparison for labelsAfterMove/labelsUnexpected regardless of which
+  // preservationSource a UID ends up using.
   const beforeMembership = await resolveLabelMembership(
     client,
     labelFolders,
     result.matchedUids.map((uid) => messageIdByUid.get(uid)),
   );
-  const originalLabelsByUid = new Map<number, string[]>();
-  result.originalFlags = [];
-  result.originalLabels = [];
+  const trashLabelsByUid = new Map<number, string[]>();
   for (const uid of result.matchedUids) {
     const messageId = messageIdByUid.get(uid);
     const paths = messageId
       ? (beforeMembership.get(messageId) ?? new Set<string>())
       : new Set<string>();
-    const labels = toSortedLabelNames(paths, delimiter);
-    originalLabelsByUid.set(uid, labels);
-    result.originalFlags.push({ uid, flags: originalFlagsByUid.get(uid) ?? [] });
-    result.originalLabels.push({ uid, labels });
+    trashLabelsByUid.set(uid, toSortedLabelNames(paths, delimiter));
   }
+
+  const receiptsByUid = new Map<number, unknown>();
+  for (const entry of restoreReceipts ?? []) {
+    if (!receiptsByUid.has(entry.uid)) {
+      receiptsByUid.set(entry.uid, entry.receipt);
+    }
+  }
+  const { baselines, rejections } = resolveBaselines(
+    result.matchedUids,
+    receiptsByUid,
+    signingSecret,
+    messageIdByUid,
+    trashLabelsByUid,
+    trashFlagsByUid,
+  );
+  if (rejections.length > 0) {
+    result.receiptRejections = rejections;
+  }
+
+  const originalLabelsByUid = new Map<number, string[]>();
+  const originalFlagsByUid = new Map<number, PreservableFlag[]>();
+  result.originalFlags = [];
+  result.originalLabels = [];
+  for (const uid of result.matchedUids) {
+    const baseline = baselines.get(uid);
+    result.preservationSource.push({ uid, source: baseline?.source ?? 'unavailable' });
+    if (baseline?.labels !== undefined) {
+      originalLabelsByUid.set(uid, baseline.labels);
+      result.originalLabels.push({ uid, labels: baseline.labels });
+    }
+    if (baseline?.flags !== undefined) {
+      originalFlagsByUid.set(uid, baseline.flags);
+      result.originalFlags.push({ uid, flags: baseline.flags });
+    }
+  }
+
+  // restoreToOriginalSource destination resolution: the sole matched uid's
+  // verified receipt sourceFolder, resolved and validated through the exact
+  // same policy an explicit destinationFolder would go through — a receipt
+  // never forces a destination that bypasses it.
+  if (restoreToOriginalSource) {
+    const onlyUid = result.matchedUids[0];
+    const baseline = onlyUid !== undefined ? baselines.get(onlyUid) : undefined;
+    if (!baseline || baseline.source !== 'restoreReceipt' || !baseline.receiptSourceFolder) {
+      throw new Error(
+        'restoreToOriginalSource requires a fully verified restoreReceipt for the matched UID, ' +
+          'with its sourceFolder — none was available.',
+      );
+    }
+    destinationFolder = resolveMoveDestination(special, baseline.receiptSourceFolder, delimiter);
+    assertMoveDestinationAllowed(special, destinationFolder);
+    assertFolderExists(folders, destinationFolder, 'destination folder');
+  }
+  const resolvedDestinationFolder = destinationFolder as string;
 
   if (dryRun) {
     return result;
@@ -356,6 +606,9 @@ export async function restoreFromTrash(
       const staleSet = new Set(staleUids);
       result.originalFlags = result.originalFlags.filter((entry) => !staleSet.has(entry.uid));
       result.originalLabels = result.originalLabels.filter((entry) => !staleSet.has(entry.uid));
+      result.preservationSource = result.preservationSource.filter(
+        (entry) => !staleSet.has(entry.uid),
+      );
     }
 
     if (result.matchedUids.length === 0) {
@@ -363,7 +616,7 @@ export async function restoreFromTrash(
     }
 
     try {
-      moveResponse = await client.messageMove(result.matchedUids, destinationFolder, {
+      moveResponse = await client.messageMove(result.matchedUids, resolvedDestinationFolder, {
         uid: true,
       });
     } catch (error) {
@@ -374,7 +627,7 @@ export async function restoreFromTrash(
       const classification = await classifyUncertainMove(
         client,
         special.trash,
-        destinationFolder,
+        resolvedDestinationFolder,
         result.matchedUids.map((uid) => ({ uid, messageId: messageIdByUid.get(uid) })),
       );
       uncertainUids = classification.uncertain;
@@ -423,12 +676,14 @@ export async function restoreFromTrash(
     for (const uid of result.changedUids) {
       const resultingUid = await reconcileResultingUid(
         client,
-        destinationFolder,
+        resolvedDestinationFolder,
         uid,
         uidMap,
         messageIdByUid.get(uid),
       );
-      transitions.push(buildTransition(uid, special.trash, destinationFolder, false, resultingUid));
+      transitions.push(
+        buildTransition(uid, special.trash, resolvedDestinationFolder, false, resultingUid),
+      );
       if (resultingUid !== undefined) {
         confirmed.push({ requestedUid: uid, resultingUid });
       } else {
@@ -439,7 +694,7 @@ export async function restoreFromTrash(
 
     // Label measurement is Message-ID correlation alone — safe to compute
     // for every changed UID regardless of whether its destination identity
-    // was confirmed.
+    // was confirmed, and regardless of preservationSource.
     const afterMembership = await resolveLabelMembership(
       client,
       labelFolders,
@@ -454,8 +709,15 @@ export async function restoreFromTrash(
         ? (afterMembership.get(messageId) ?? new Set<string>())
         : new Set<string>();
       const afterLabels = toSortedLabelNames(afterPaths, delimiter);
-      const originalLabels = originalLabelsByUid.get(uid) ?? [];
       result.labelsAfterMove.push({ uid, labels: afterLabels });
+
+      const originalLabels = originalLabelsByUid.get(uid);
+      if (originalLabels === undefined) {
+        // preservationSource 'unavailable': no trusted baseline to diff
+        // against — never claim something is "missing" or "unexpected"
+        // when this project doesn't actually know what was expected.
+        continue;
+      }
       const afterSet = new Set(afterLabels);
       labelsMissingByUid.set(
         uid,
@@ -478,14 +740,19 @@ export async function restoreFromTrash(
     const flagsUnexpectedByUid = new Map<number, PreservableFlag[]>();
     const verified: Array<{ requestedUid: number; resultingUid: number }> = [];
     for (const { requestedUid, resultingUid } of confirmed) {
-      const fetched = await fetchPreservableFlags(client, destinationFolder, resultingUid);
+      const fetched = await fetchPreservableFlags(client, resolvedDestinationFolder, resultingUid);
       if (fetched === undefined) {
         result.requiresRefresh = true;
         continue;
       }
       verified.push({ requestedUid, resultingUid });
-      const original = originalFlagsByUid.get(requestedUid) ?? [];
       result.flagsAfterMove.push({ uid: requestedUid, flags: fetched });
+
+      const original = originalFlagsByUid.get(requestedUid);
+      if (original === undefined) {
+        // preservationSource 'unavailable' — measured, never repaired.
+        continue;
+      }
       const missing = flagsMissing(original, fetched);
       const unexpected = flagsUnexpected(original, fetched);
       if (missing.length > 0) {
@@ -496,8 +763,12 @@ export async function restoreFromTrash(
       }
     }
 
-    // AUTOMATIC REPAIR — only for uids in `verified`: a confirmed
-    // destination identity whose current state was actually re-fetched.
+    // AUTOMATIC REPAIR — only for uids in `verified` (confirmed destination
+    // identity) AND whose preservationSource is trusted enough to have a
+    // baseline at all (originalFlagsByUid/originalLabelsByUid only contain
+    // entries for 'restoreReceipt'/'trashSnapshot' — 'unavailable' UIDs
+    // were never added to either map, so they naturally fall out of every
+    // repair computation below without needing an extra branch).
     const labelsRestored: RestoreLabelOutcome[] = [];
     const labelsFailed: RestoreLabelFailure[] = [];
     const flagsRestored: RestoreFlagOutcome[] = [];
@@ -511,12 +782,12 @@ export async function restoreFromTrash(
         (flagsUnexpectedByUid.get(target.requestedUid) ?? []).includes(flag),
       );
       if (toAdd.length > 0) {
-        const outcome = await repairFlag(client, destinationFolder, flag, toAdd, true);
+        const outcome = await repairFlag(client, resolvedDestinationFolder, flag, toAdd, true);
         flagsRestored.push(...outcome.restored);
         flagsFailed.push(...outcome.failed);
       }
       if (toRemove.length > 0) {
-        const outcome = await repairFlag(client, destinationFolder, flag, toRemove, false);
+        const outcome = await repairFlag(client, resolvedDestinationFolder, flag, toRemove, false);
         flagsRestored.push(...outcome.restored);
         flagsFailed.push(...outcome.failed);
       }
@@ -546,7 +817,9 @@ export async function restoreFromTrash(
     if (uidsByLabel.size > 0) {
       // Re-list immediately before reapplying: confirms each label still
       // exists as a mailbox right now, not from the listing fetched at the
-      // top of this call. Labels are never auto-created.
+      // top of this call. Labels are never auto-created — including a
+      // label a valid receipt says was originally present but has since
+      // been deleted from the account entirely.
       const freshFolders = await client.list();
       const resultingUidByRequestedUid = new Map(
         verified.map((target) => [target.requestedUid, target.resultingUid]),
@@ -575,7 +848,7 @@ export async function restoreFromTrash(
         );
         try {
           const applyResult = await applyLabel(client, {
-            folder: destinationFolder,
+            folder: resolvedDestinationFolder,
             label,
             uids: resultingUids,
             dryRun: false,
@@ -637,6 +910,23 @@ export async function restoreFromTrash(
     result.labelsFailed = labelsFailed;
     result.flagsRestored = flagsRestored;
     result.flagsFailed = flagsFailed;
+
+    // statePreserved (0.4.2): the full round-trip guarantee this project can
+    // actually back — restoreReceipt-sourced, identity-confirmed, and zero
+    // repair failures for that specific uid. trashSnapshot and unavailable
+    // are never true here, even with a clean repair — see the field's doc
+    // comment on RestoreResult above.
+    const labelsFailedUids = new Set(labelsFailed.map((entry) => entry.uid));
+    const flagsFailedUids = new Set(flagsFailed.map((entry) => entry.uid));
+    for (const uid of result.matchedUids) {
+      const source = baselines.get(uid)?.source ?? 'unavailable';
+      const preserved =
+        source === 'restoreReceipt' &&
+        verifiedRequestedUids.has(uid) &&
+        !labelsFailedUids.has(uid) &&
+        !flagsFailedUids.has(uid);
+      result.statePreserved.push({ uid, preserved });
+    }
   } catch (error) {
     // A reconnect/failure anywhere in verification or repair must never
     // swallow a folder move that already succeeded — report the
@@ -649,6 +939,11 @@ export async function restoreFromTrash(
         : 'Unknown error during post-move verification/repair.';
     for (const uid of result.changedUids) {
       result.errors.push({ uid, message: `Post-move verification/repair incomplete: ${message}` });
+    }
+    for (const uid of result.matchedUids) {
+      if (!result.statePreserved.some((entry) => entry.uid === uid)) {
+        result.statePreserved.push({ uid, preserved: false });
+      }
     }
   }
 

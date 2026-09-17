@@ -21,7 +21,7 @@ import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.4.1';
+const SERVER_VERSION = '0.4.2';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -53,7 +53,28 @@ const SERVER_VERSION = '0.4.1';
  * (dryRun: false) is unconditionally refused by a hard feature gate
  * (blocked: true, blockReason: "livePermanentDeleteDisabled") before any
  * IMAP mutating command runs; see src/mutations/permanent-delete.ts and
- * SECURITY.md ("Permanent delete is feature-gated off in 0.4.0").
+ * SECURITY.md ("Permanent delete is feature-gated off"). This gate is
+ * unchanged as of 0.4.2 — see below.
+ * 0.4.1 ("State-Preserving Restore") hardened mail_restore_from_trash to
+ * snapshot and repair flags/labels around a live move, using Trash's own
+ * state as the "before" baseline.
+ * 0.4.2 ("Durable Restore Snapshot") found that baseline insufficient: a
+ * live finding showed Proton Bridge can drop a message's labels
+ * *asynchronously*, after mail_trash's own immediate post-move check
+ * already reported them intact — so by the time a later
+ * mail_restore_from_trash call measured Trash, the labels were already
+ * gone. mail_trash now optionally issues a signed `restoreReceipts` entry
+ * per identity-confirmed live-moved UID (see
+ * src/security/restore-receipt.ts), captured BEFORE the move; passing it
+ * back via mail_restore_from_trash's `restoreReceipts` input makes that
+ * pre-Trash snapshot the authoritative baseline instead
+ * (`preservationSource: "restoreReceipt"`), immune to Trash's later decay.
+ * A UID with no receipt keeps the 0.4.1 `trashSnapshot` fallback; a UID
+ * whose supplied receipt fails verification fails closed
+ * (`preservationSource: "unavailable"` — see `receiptRejections`), never
+ * silently downgrading. This is fully additive: an install with no
+ * receipt-signing secret provisioned (scripts/configure-receipt-signing.sh)
+ * behaves exactly as 0.4.1 did. See SECURITY.md ("Restore receipts").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */

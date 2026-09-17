@@ -20,7 +20,7 @@ below. **V4** (0.4.0, "Safe Trash Lifecycle", hardened in 0.4.1) adds `mail_tras
 `mail_restore_from_trash`, and `mail_delete_permanently` — the last is implemented and fully unit-tested,
 but live execution is unconditionally disabled by a hard feature gate until a separate, dedicated
 destructive-action validation. See ["V4 — Safe Trash
-Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041) below.
+Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042) below.
 
 ## Security model
 
@@ -44,7 +44,7 @@ Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041) below.
   SMTP/send/reply/forward tool — not "disabled," genuinely not implemented, in any version. V4 (0.4.0) adds
   `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` — implemented
   and fully unit-tested, but its live execution is unconditionally refused by a hard feature gate; see ["V4 —
-  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041).
+  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
 - **Email content is always labeled untrusted, and can never drive a mutation.** See ["Threat
   model"](#threat-model-prompt-injection-via-email).
 
@@ -97,7 +97,8 @@ src/
 
 tests/                    # Vitest; no live IMAP connection, no live HTTP to a real mailing list, see "Development commands"
 scripts/
-  configure-bridge.sh     # one-time manual setup: Keychain + non-secret config
+  configure-bridge.sh              # one-time manual setup: Keychain + non-secret config
+  configure-receipt-signing.sh     # optional (0.4.2): provisions the restore-receipt HMAC signing secret
 ```
 
 Each tool call opens a fresh IMAP connection, does its work, and closes the connection — there is no
@@ -164,6 +165,18 @@ recovery codes, or 2FA tokens. You sign in to Bridge yourself, manually, outside
    See ["Keychain configuration"](#keychain-configuration) for exactly what this does.
 
 6. **Register the server with Claude Code.** See ["Claude Code integration"](#claude-code-integration).
+
+7. **Optional (0.4.2): provision the restore-receipt signing secret.** Only needed for the strong
+   `mail_restore_from_trash` preservation guarantee (`preservationSource: "restoreReceipt"`) — skip this and
+   everything else keeps working exactly as it did in 0.4.1.
+
+   ```
+   ./scripts/configure-receipt-signing.sh
+   ```
+
+   See "0.4.2 — durable restore receipts, and why Trash is not authoritative" in the ["V4 — Safe Trash
+   Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042) section below, and
+   SECURITY.md ("Restore receipts").
 
 ## Keychain configuration
 
@@ -297,7 +310,7 @@ change what a tool can actually do; the real protections are unchanged.
 | `mail_create_label`  | `name`                                                         | Creates a flat custom label under `Labels/`; does not apply it to any message. Rejects raw paths and names already used by a folder or label.                                                                                                             |
 
 V4 (0.4.0) adds three more mutation tools, described in full in ["V4 — Safe Trash
-Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041): `mail_trash`, `mail_restore_from_trash`, and
+Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042): `mail_trash`, `mail_restore_from_trash`, and
 `mail_delete_permanently` (implemented and dry-run capable — live execution is feature-gated off).
 
 ## Mutation model
@@ -610,7 +623,7 @@ None of the following exist in this codebase, in any version:
 - rename or delete folder (only `mail_create_folder` exists so far)
 - **live permanent message deletion** — V4 (0.4.0) added `mail_delete_permanently`, fully implemented and
   unit-tested, but its live execution (`dryRun: false`) is unconditionally refused by a hard feature gate;
-  see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041)
+  see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042)
 - any tool that accepts a search query, wildcard, or "everything" selector as a mutation target — message
   mutations take explicit UIDs, while folder creation takes an explicit name; `mail_unsubscribe` takes
   exactly one explicit UID, never a batch
@@ -790,7 +803,7 @@ project does not call, wrap, or depend on that feature — `mail_unsubscribe` im
 mechanism this project's own security model explicitly supports (RFC 8058 HTTPS one-click), independently of
 whatever Proton's client does or does not do for the same message.
 
-## V4 — Safe Trash Lifecycle (0.4.0, hardened in 0.4.1)
+## V4 — Safe Trash Lifecycle (0.4.0, hardened in 0.4.1, durable receipts in 0.4.2)
 
 Three new mutation tools, all explicit-UID-only (never a search or "everything"), all defaulting to
 `dryRun: true`.
@@ -799,8 +812,8 @@ Three new mutation tools, all explicit-UID-only (never a search or "everything")
 
 | Capability                                     | Status                                                                          |
 | ---------------------------------------------- | ------------------------------------------------------------------------------- |
-| Move to Trash (`mail_trash`)                   | Supported (live)                                                                |
-| Restore from Trash (`mail_restore_from_trash`) | Supported (live), automatically preserving flags/labels (0.4.1)                 |
+| Move to Trash (`mail_trash`)                   | Supported (live), optionally issues a signed restore receipt (0.4.2)            |
+| Restore from Trash (`mail_restore_from_trash`) | Supported (live), automatically preserving flags/labels (0.4.1/0.4.2)           |
 | Permanent delete — dry-run                     | Supported                                                                       |
 | Permanent delete — live                        | **Disabled**, unconditionally, pending a separate destructive-action validation |
 
@@ -828,6 +841,69 @@ measured what the caller's `labelsToRestore` explicitly asked for. 0.4.1 changes
 
 See "Trash lifecycle: labels are measured, never assumed" in SECURITY.md for the full threat model this
 addresses.
+
+### 0.4.2 — durable restore receipts, and why Trash is not authoritative
+
+A second live validation, done specifically to check 0.4.1's fix, found the fix itself insufficient. What
+happened:
+
+1. `mail_trash` moved a message Archive -> Trash. Its **own** immediate post-move check reported both
+   labels intact — `labelsRemovedByTrash: []`.
+2. Sometime after that call returned — **asynchronously**, outside this project's control — Proton Bridge
+   silently dropped both labels from the message while it sat in Trash.
+3. A later `mail_restore_from_trash` call measured Trash's "before" state as its baseline (0.4.1's whole
+   mechanism) and found **zero** labels there — because they were already gone by then. With nothing to
+   compare against, 0.4.1's repair had nothing to reapply.
+4. The message came back to Archive missing both labels, and the tool's own bookkeeping showed no failure,
+   because by its own (correct, as far as it went) measurement nothing had diverged _during this call_.
+
+**The root problem:** Trash's state at restore time is not the same thing as the message's state before it
+was ever trashed, and 0.4.1 conflated the two. No read-only measurement taken _at restore time_ can recover
+information that was already lost _before_ restore time began.
+
+**The fix:** capture the snapshot once, at `mail_trash` time — before any possible async decay — sign it, and
+hand it back to the caller as an opaque **restore receipt**. `mail_restore_from_trash` accepts that receipt
+back later and, once verified, treats it as the authoritative "original state" instead of whatever Trash
+happens to show by then.
+
+```json
+// mail_trash (live, signing secret provisioned) response excerpt
+{
+  "restoreReceipts": [
+    {
+      "uid": 42,
+      "restoreReceipt": {
+        "v": 1,
+        "sourceFolder": "Archive",
+        "originalLabels": ["Personal", "Work"],
+        "originalFlags": ["\\Seen"],
+        "identity": "…64-char hex HMAC, never the raw Message-ID…",
+        "issuedAt": "2026-09-17T00:00:00.000Z",
+        "signature": "…64-char hex HMAC…"
+      }
+    }
+  ]
+}
+```
+
+Pass that same object back, untouched, via `mail_restore_from_trash`'s `restoreReceipts` input
+(`[{ "uid": 42, "receipt": { ...as returned... } }]`). Once it is fully verified (structure, HMAC signature,
+and a keyed Message-ID fingerprint match against the live Trash message — see "Restore receipts" in
+SECURITY.md), the result reports `preservationSource: "restoreReceipt"` for that UID and repairs from the
+receipt's `originalLabels`/`originalFlags`, immune to whatever Trash has decayed to in the meantime.
+
+**A UID with no receipt** falls back to 0.4.1's behavior — Trash's current state is still measured and
+repaired-towards (`preservationSource: "trashSnapshot"`) — but `statePreserved` is never `true` for it, since
+this project cannot prove that baseline predates any async loss.
+
+**A UID whose supplied receipt fails verification** (wrong secret, tampered field, wrong message, expired
+Keychain entry, anything) fails **closed**: `preservationSource: "unavailable"`, reported in
+`receiptRejections`, and **neither** the receipt **nor** a `trashSnapshot` fallback is used to repair that
+UID — this project would rather do nothing than guess.
+
+This is fully additive and requires no action to keep working exactly as 0.4.1 did:
+`scripts/configure-receipt-signing.sh` provisions the signing secret; without it, `mail_trash` issues no
+receipts and `mail_restore_from_trash` behaves exactly as in 0.4.1.
 
 ### Archive vs. Trash — not the same operation
 
@@ -894,14 +970,18 @@ Drafts, All Mail, a bare namespace container, or a `Labels/...` reference are al
 outright rather than given its own ad-hoc acknowledgement parameter — `mail_mark_spam` already exists as the
 one, specifically-gated way to put a message in Spam.
 
-**Automatic state preservation (0.4.1).** Before any move, this tool snapshots each matched message's
-preservable flags and full label membership while it is still in Trash (`originalFlags`, `originalLabels`).
-After a live move — only for a UID whose destination identity was confirmed via the same
-UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project uses, never a guess —
-both are re-measured (`flagsAfterMove`, `labelsAfterMove`) and any divergence from the snapshot is repaired
-automatically: a missing label is reapplied (never created), a flipped flag is flipped back. A label present
-after the move that was NOT present before it is reported in `labelsUnexpected` but never removed
-automatically — there is no clear evidence it was this operation's doing.
+**Automatic state preservation (0.4.1, baseline hardened in 0.4.2).** Before any move, this tool resolves each
+matched UID's baseline (`originalFlags`, `originalLabels`) — from a verified `restoreReceipts` entry when one
+is supplied (`preservationSource: "restoreReceipt"`), otherwise from Trash's current state, exactly as 0.4.1
+always did (`preservationSource: "trashSnapshot"`) — see "0.4.2 — durable restore receipts" above for why
+these are not equivalent guarantees. After a live move — only for a UID whose destination identity was
+confirmed via the same UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project
+uses, never a guess — both are re-measured (`flagsAfterMove`, `labelsAfterMove`) and any divergence from the
+baseline is repaired automatically: a missing label is reapplied (never created), a flipped flag is flipped
+back. A label present after the move that was NOT present before it is reported in `labelsUnexpected` but
+never removed automatically — there is no clear evidence it was this operation's doing. `statePreserved` is
+`true` only for a `restoreReceipt`-sourced, identity-confirmed UID with zero repair failures — the one
+combination this project can actually back as a full round-trip guarantee.
 
 `labelsToRestore` means EXTRA labels the caller explicitly wants guaranteed, **in addition to — never instead
 of** — the automatically-preserved set; both are unioned and deduplicated. Each extra is validated to exist
@@ -917,6 +997,8 @@ the outcome explicitly:
 ```json
 {
   "moveRestored": [42],
+  "preservationSource": [{ "uid": 42, "source": "restoreReceipt" }],
+  "statePreserved": [{ "uid": 42, "preserved": true }],
   "originalFlags": [{ "uid": 42, "flags": [] }],
   "flagsAfterMove": [{ "uid": 42, "flags": ["\\Seen"] }],
   "flagsRestored": [{ "uid": 42, "flag": "\\Seen" }],
@@ -975,8 +1057,8 @@ unconditionally refused** by a hard feature gate before any IMAP mutating comman
 }
 ```
 
-This is a deliberate, documented limitation, not a bug — see ["Why permanent delete is feature-gated off in
-0.4.0"](#why-permanent-delete-is-feature-gated-off-in-040) in SECURITY.md. A dry-run only resolves which of
+This is a deliberate, documented limitation, not a bug — see ["Why permanent delete is feature-gated
+off"](#why-permanent-delete-is-feature-gated-off) in SECURITY.md. A dry-run only resolves which of
 the requested UIDs currently exist in Trash; it issues zero IMAP mutating commands.
 
 ### Why mailbox-wide EXPUNGE is forbidden
@@ -1035,7 +1117,7 @@ This server's defenses:
    `acknowledgeRestoreFromTrash: true`; `mail_delete_permanently` requires all of `dryRun: false`,
    `confirm: true`, `acknowledgePermanentDeletion: true`, AND `confirmationPhrase` exactly
    `"DELETE PERMANENTLY"` — and even then, live execution is unconditionally refused by a feature gate. See
-   ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041).
+   ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
 4. **No raw HTML, bounded size.** HTML-only messages are converted to inert plain text before being returned,
    and bodies are capped at 20,000 characters.
 5. **`List-Unsubscribe` is treated as hostile input, structurally.** `mail_unsubscribe` never reads the

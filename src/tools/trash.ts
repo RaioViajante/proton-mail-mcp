@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
+import { getReceiptSigningSecretOrUndefined } from '../bridge/config.js';
 import { withBridgeConnection } from '../bridge/client.js';
 import { MAX_MUTATION_UIDS } from '../mutations/batch.js';
 import { trashMessages } from '../mutations/trash.js';
@@ -49,7 +50,11 @@ export function registerTrashTool(server: McpServer): void {
         'affected — never a search or "everything in this folder". UIDs are mailbox-local and may ' +
         'change after this move; check the result\'s "transitions" for the resultingUid (or ' +
         'requiresRefresh) in Trash — a connection drop after the move command is sent is never ' +
-        'assumed to be a clean failure or success, only confirmed read-only.',
+        'assumed to be a clean failure or success, only confirmed read-only. When a restore-receipt ' +
+        'signing secret is provisioned (scripts/configure-receipt-signing.sh, 0.4.2), a live, ' +
+        'identity-confirmed move also returns "restoreReceipts": a signed, pre-Trash snapshot per ' +
+        'UID to hand back to mail_restore_from_trash later, for a stronger preservation guarantee ' +
+        "than Trash's own (possibly already-decayed) state can offer by then.",
       inputSchema,
       annotations: {
         readOnlyHint: false,
@@ -62,7 +67,10 @@ export function registerTrashTool(server: McpServer): void {
       },
     },
     async (args) => {
-      const result = await withBridgeConnection((client) => trashMessages(client, args));
+      const signingSecret = await getReceiptSigningSecretOrUndefined();
+      const result = await withBridgeConnection((client) =>
+        trashMessages(client, { ...args, signingSecret }),
+      );
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },
   );

@@ -14,9 +14,11 @@ import { registerMoveTool } from './tools/move.js';
 import { registerRemoveLabelTool } from './tools/remove-label.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
 import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
+import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
+import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.2.7';
+const SERVER_VERSION = '0.3.0';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -32,6 +34,12 @@ const SERVER_VERSION = '0.2.7';
  * expunges, sends, or touches SMTP. mail_mark_spam alone has destructiveHint:
  * true because Proton may persistently filter future messages from its sender.
  * V2.5 adds five read-only metadata analysis tools; none calls a mutation.
+ * V3 (0.3.0, "Controlled Unsubscribe") adds mail_unsubscribe_preview
+ * (readOnlyHint: true, zero network requests) and mail_unsubscribe
+ * (readOnlyHint: false), which executes ONLY the RFC 8058 HTTPS one-click
+ * mechanism for one explicit UID at a time — never mailto, never a body
+ * link, never browser automation. See src/unsubscribe/ and SECURITY.md
+ * ("External HTTP side effect").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -57,6 +65,9 @@ export function createServer(): McpServer {
   registerCreateLabelTool(server);
 
   registerTriageIntelligenceTools(server);
+
+  registerUnsubscribePreviewTool(server);
+  registerUnsubscribeTool(server);
 
   return server;
 }

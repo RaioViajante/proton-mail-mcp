@@ -43,7 +43,10 @@ certificate, supplied via `tls.ca`).
 ## No SMTP, ever
 
 There is no SMTP client, no send capability, and no reply/forward capability anywhere in this
-codebase — in V1 or V2, and there is no plan to add one.
+codebase — in V1, V2, or V3, and there is no plan to add one. `mail_unsubscribe` (V3, 0.3.0) never
+sends a `mailto:` unsubscribe request for exactly this reason: doing so would mean sending mail for
+the first time ever from this project. It detects and reports a `mailto:`-only mechanism in
+`mail_unsubscribe_preview`, but never executes it — see "External HTTP side effect" below.
 
 ## No destructive IMAP commands, ever
 
@@ -133,8 +136,77 @@ returned. A one-click header is reported as capability metadata; no GET, POST, m
 automation, or unsubscribe execution occurs. See README.md ("V2.5 — Triage intelligence and rule
 proposals").
 
+## External HTTP side effect: controlled unsubscribe (0.3.0)
+
+`mail_unsubscribe` is this project's first — and, deliberately, only — code path that makes an outbound
+network request to a host this project does not control. Everything in this section exists because of
+that one exception to "no network-facing surface beyond `127.0.0.1`" (see "Reporting" below).
+
+**Threat model.** `List-Unsubscribe` / `List-Unsubscribe-Post` are headers inside an email — fully
+attacker-controlled, exactly like subject or body (see "Email body is untrusted input"). A malicious sender
+could put anything there: a localhost URL, a LAN address, a cloud metadata endpoint, an oversized response, a
+slow/hanging server, or a redirect to a second, different host.
+
+**SSRF defenses (`src/unsubscribe/url-safety.ts`, `http-client.ts`).** Every candidate URL is checked
+structurally (HTTPS-only, port 443 only, no embedded credentials, no fragment, no `localhost`/`.local`/known
+metadata hostnames, no private/loopback/link-local/multicast/unspecified literal IP — IPv4 and IPv6,
+including an IPv4-mapped IPv6 bypass attempt like `::ffff:127.0.0.1`) before any DNS lookup happens at all.
+After resolution, **every** address the resolver returns must be public (not just the first), and the
+specific address validated is the literal address the socket connects to — via a custom DNS `lookup`
+override — so nothing can re-resolve the hostname to something private between validation and connection.
+No redirect is ever followed (a 3xx is reported as `outcome: "uncertain"`, never a second request). No
+cookies, `Authorization`, or `Referer` are ever sent. The response body is read only far enough to enforce a
+64 KiB cap and is never returned or logged.
+
+**Authentication trust boundary.** This project does not perform DKIM cryptographic verification. Doing so
+correctly would require DNS TXT key lookups, canonicalization, and signature verification — real complexity
+and a second class of DNS-based attack surface, for a feature whose whole premise is caution. Instead,
+`authenticationStatus` trusts Proton's own receiving-MTA verdict, read from the standard
+`Authentication-Results` header, only the **first (topmost)** occurrence. That specific choice is a
+deliberate defense: a compliant receiving MTA prepends its own `Authentication-Results` on receipt, so the
+topmost occurrence is that MTA's own verdict, not one a sender could forge further down in the raw message
+(RFC 7001/8601 warn about exactly this class of spoofing). Only a `dmarc=pass` or a domain-aligned
+`dkim=pass` is treated as `verified`; every other state — including a `DKIM-Signature` header with no
+resolvable verdict at all — is `evidence-present-but-not-cryptographically-verified` or `unavailable`, and
+both **fail closed**: `mail_unsubscribe` refuses to execute unless `authenticationStatus` is exactly
+`verified`. This is intentionally conservative rather than complete; see README.md ("Authentication status
+— what 'verified' actually means") for the full state table.
+
+**Token/URL leakage.** `mail_unsubscribe_preview`'s output is built field-by-field in
+`decision.ts`'s `toPublicPreview()` — never a spread of the internal decision object — specifically so a
+full URL, query string, path, or `mailto:` recipient can never leak into a tool result even if a field is
+added later. Only a normalized hostname (`targetHost`) is ever returned. `mail_unsubscribe`'s live result
+carries the same `targetHost`, an HTTP status code, and a coarse `outcome`; it never returns the response
+body, the unsubscribe URL, or any token. Neither tool's Zod schema accepts a URL, header value, or
+pre-computed eligibility from the caller — every decision is re-derived from a fresh IMAP fetch on every
+call, so a stale or forged "trust me, it's eligible" input from a client is structurally impossible.
+
+**Consent and revalidation.** Live execution requires `dryRun: false`, `confirm: true`, AND
+`acknowledgeExternalUnsubscribe: true` together — any one missing is rejected before any header is even
+re-read, let alone before any network call. `dryRun: true` (the default) makes zero network requests,
+provably: `unsubscribe()` returns before ever calling the SSRF-checking/DNS/HTTP layers. Immediately before
+the one HTTP request it is allowed to make, `mail_unsubscribe` re-fetches the message and requires its
+identity (Message-ID) and every header the eligibility decision depends on to be byte-identical to the first
+fetch — mirroring the write-lock revalidation idiom every IMAP mutation in this project already follows
+(see "Stale UIDs are never reused blindly"), adapted here for an external HTTP side effect instead of an
+IMAP write. Any drift — the message disappearing, its identity changing, its headers changing — aborts with
+zero network requests.
+
+**Why body links and `mailto:` execution are unsupported.** A link found in the message body is even less
+standardized and more easily spoofed than a header; trusting it to pick a live network destination is
+exactly the class of input this project's threat model exists to resist. `mailto:` execution is unsupported
+because it would require this project to send mail, which contradicts "No SMTP, ever" above. Both are
+detected and reported by `mail_unsubscribe_preview` — you always know they exist — neither is ever executed.
+
+**Proton's own unsubscribe feature.** Proton's own clients already unsubscribe some senders on your behalf.
+This project does not call, wrap, or rely on that feature in any way; `mail_unsubscribe` implements only the
+one mechanism (RFC 8058 HTTPS one-click) this project's own security model explicitly supports, independent
+of what Proton's client does for the same message.
+
 ## Reporting
 
-This is a personal, local-only project with no network-facing surface beyond `127.0.0.1`. If you
+This is a personal, local-only project whose only network-facing surface beyond `127.0.0.1` is the single,
+heavily-restricted outbound HTTPS request `mail_unsubscribe` may make — see "External HTTP side effect"
+above. If you
 fork or extend it and find a security issue, treat it with the same care as the points above:
 prefer removing a footgun over rationalizing it.

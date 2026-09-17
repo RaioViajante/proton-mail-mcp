@@ -14,6 +14,8 @@ import { registerMoveTool } from '../src/tools/move.js';
 import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
 import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
+import { registerUnsubscribePreviewTool } from '../src/tools/unsubscribe-preview.js';
+import { registerUnsubscribeTool } from '../src/tools/unsubscribe.js';
 
 interface CapturedRegistration {
   name: string;
@@ -37,10 +39,13 @@ const readOnlyRegistrars = [
   registerListMessagesTool,
   registerSearchMailTool,
   registerGetMessageTool,
+  registerUnsubscribePreviewTool,
 ];
 
 // V2: mutation tools; every UID-based tool operates on explicit UIDs.
-// Spam alone is annotated destructive because Proton may persistently filter its sender.
+// mail_mark_spam and mail_unsubscribe are annotated destructive: spam
+// because Proton may persistently filter its sender, unsubscribe because it
+// is an external, irreversible-by-this-tool side effect.
 const mutationRegistrars = [
   registerMarkReadTool,
   registerMarkUnreadTool,
@@ -51,6 +56,7 @@ const mutationRegistrars = [
   registerRemoveLabelTool,
   registerCreateFolderTool,
   registerCreateLabelTool,
+  registerUnsubscribeTool,
 ];
 const intelligenceNames = [
   'mail_automation_candidates',
@@ -65,6 +71,7 @@ const EXPECTED_READ_ONLY_NAMES = [
   'mail_list_folders',
   'mail_list_messages',
   'mail_search',
+  'mail_unsubscribe_preview',
 ];
 
 const EXPECTED_MUTATION_NAMES = [
@@ -77,15 +84,21 @@ const EXPECTED_MUTATION_NAMES = [
   'mail_mark_unread',
   'mail_move',
   'mail_remove_label',
+  'mail_unsubscribe',
 ];
 
+const DESTRUCTIVE_HINT_EXPECTED = new Set(['mail_mark_spam', 'mail_unsubscribe']);
+
 // Verbs that must NEVER appear in ANY tool name in this project, V1 or V2 —
-// see README.md "V2 NÃO pode conter" / SECURITY.md.
+// see README.md "V2 NÃO pode conter" / SECURITY.md. "unsubscribe" was
+// removed from this list in 0.3.0: it is now supported, but ONLY through
+// mail_unsubscribe_preview / mail_unsubscribe's narrow, RFC 8058-only,
+// consent-gated path — see SECURITY.md ("External HTTP side effect").
 const BANNED_NAME_PATTERN =
-  /^mail_(delete|trash|expunge|smtp|send(?:_|$)|reply|forward|permanent|unsubscribe|block[_-]?list|allow[_-]?list|draft.?send)/i;
+  /^mail_(delete|trash|expunge|smtp|send(?:_|$)|reply|forward|permanent|block[_-]?list|allow[_-]?list|draft.?send)/i;
 
 describe('V1 read-only tool registration', () => {
-  it('registers exactly the four documented read-only tool names', () => {
+  it('registers exactly the five documented read-only tool names', () => {
     const names = readOnlyRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
@@ -102,7 +115,7 @@ describe('V1 read-only tool registration', () => {
 });
 
 describe('V2 mutation tool registration', () => {
-  it('registers exactly the nine documented mutation tool names', () => {
+  it('registers exactly the ten documented mutation tool names', () => {
     const names = mutationRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
@@ -116,16 +129,22 @@ describe('V2 mutation tool registration', () => {
     }
   });
 
-  it('marks every V2 tool non-destructive, except mail_mark_spam', () => {
+  it('marks every V2 tool non-destructive, except mail_mark_spam and mail_unsubscribe', () => {
     for (const register of mutationRegistrars) {
       const [registration] = captureRegistrations(register);
-      const expected = registration?.name === 'mail_mark_spam';
+      const expected = DESTRUCTIVE_HINT_EXPECTED.has(registration?.name ?? '');
       expect(registration?.config.annotations?.destructiveHint).toBe(expected);
     }
   });
 
   it('mail_mark_spam is explicitly annotated destructiveHint: true', () => {
     const [registration] = captureRegistrations(registerMarkSpamTool);
+    expect(registration?.config.annotations?.destructiveHint).toBe(true);
+    expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+  });
+
+  it('mail_unsubscribe is explicitly annotated destructiveHint: true', () => {
+    const [registration] = captureRegistrations(registerUnsubscribeTool);
     expect(registration?.config.annotations?.destructiveHint).toBe(true);
     expect(registration?.config.annotations?.readOnlyHint).toBe(false);
   });
@@ -138,12 +157,12 @@ describe('the full tool surface', () => {
     registerTriageIntelligenceTools,
   ];
 
-  it('is exactly 18 tools, matching V1 (4) + V2/V2.6 (9) + V2.5 (5)', () => {
+  it('is exactly 20 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(18);
-    expect(new Set(names).size).toBe(18); // no accidental duplicate names
+    expect(names).toHaveLength(20);
+    expect(new Set(names).size).toBe(20); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {

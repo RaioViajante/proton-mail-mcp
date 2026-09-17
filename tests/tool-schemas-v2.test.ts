@@ -8,6 +8,8 @@ import { inputSchema as markSpamSchema } from '../src/tools/mark-spam.js';
 import { inputSchema as markUnreadSchema } from '../src/tools/mark-unread.js';
 import { inputSchema as moveSchema } from '../src/tools/move.js';
 import { inputSchema as removeLabelSchema } from '../src/tools/remove-label.js';
+import { inputSchema as unsubscribeSchema } from '../src/tools/unsubscribe.js';
+import { inputSchema as unsubscribePreviewSchema } from '../src/tools/unsubscribe-preview.js';
 
 const uidBasedSchemas = {
   mail_mark_read: markReadSchema,
@@ -162,5 +164,57 @@ describe('mail_create_label input schema', () => {
   it('accepts explicit live intent but no parent/nesting parameter', () => {
     expect(createLabelSchema.parse({ name: 'News', dryRun: false }).dryRun).toBe(false);
     expect(createLabelSchema.safeParse({ name: 'News', parent: 'Other' }).success).toBe(false);
+  });
+});
+
+describe('mail_unsubscribe_preview input schema', () => {
+  it('requires folder and uid, exactly one message per call', () => {
+    expect(unsubscribePreviewSchema.safeParse({}).success).toBe(false);
+    expect(unsubscribePreviewSchema.safeParse({ folder: 'INBOX' }).success).toBe(false);
+    expect(unsubscribePreviewSchema.safeParse({ folder: 'INBOX', uid: 1 }).success).toBe(true);
+  });
+
+  it('has no dryRun/confirm fields — it is unconditionally read-only', () => {
+    const result = unsubscribePreviewSchema.parse({ folder: 'INBOX', uid: 1 });
+    expect(result).toEqual({ folder: 'INBOX', uid: 1 });
+  });
+
+  it('rejects a non-positive or non-integer uid', () => {
+    expect(unsubscribePreviewSchema.safeParse({ folder: 'INBOX', uid: 0 }).success).toBe(false);
+    expect(unsubscribePreviewSchema.safeParse({ folder: 'INBOX', uid: -1 }).success).toBe(false);
+    expect(unsubscribePreviewSchema.safeParse({ folder: 'INBOX', uid: 1.5 }).success).toBe(false);
+  });
+});
+
+describe('mail_unsubscribe input schema', () => {
+  it('requires folder and uid, exactly one message per call (no uids array)', () => {
+    expect(unsubscribeSchema.safeParse({}).success).toBe(false);
+    expect(unsubscribeSchema.safeParse({ folder: 'INBOX' }).success).toBe(false);
+    expect(unsubscribeSchema.safeParse({ folder: 'INBOX', uid: 1 }).success).toBe(true);
+  });
+
+  it('defaults dryRun to true and both confirmations to false', () => {
+    const result = unsubscribeSchema.parse({ folder: 'INBOX', uid: 1 });
+    expect(result.dryRun).toBe(true);
+    expect(result.confirm).toBe(false);
+    expect(result.acknowledgeExternalUnsubscribe).toBe(false);
+  });
+
+  it('accepts explicit live intent with both confirmations', () => {
+    const result = unsubscribeSchema.parse({
+      folder: 'INBOX',
+      uid: 1,
+      dryRun: false,
+      confirm: true,
+      acknowledgeExternalUnsubscribe: true,
+    });
+    expect(result.dryRun).toBe(false);
+    expect(result.confirm).toBe(true);
+    expect(result.acknowledgeExternalUnsubscribe).toBe(true);
+  });
+
+  it('rejects a non-positive uid', () => {
+    expect(unsubscribeSchema.safeParse({ folder: 'INBOX', uid: 0 }).success).toBe(false);
+    expect(unsubscribeSchema.safeParse({ folder: 'INBOX', uid: -1 }).success).toBe(false);
   });
 });

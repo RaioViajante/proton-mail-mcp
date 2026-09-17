@@ -25,6 +25,7 @@ import { registerTrashTool } from '../src/tools/trash.js';
 import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from '../src/tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from '../src/tools/unsubscribe.js';
+import { registerSystemStatusTool } from '../src/tools/system-status.js';
 import { inputSchema as replyInputSchema } from '../src/tools/reply.js';
 import { inputSchema as replyPreviewInputSchema } from '../src/tools/reply-preview.js';
 import { inputSchema as forwardInputSchema } from '../src/tools/forward.js';
@@ -332,14 +333,15 @@ describe('the full tool surface', () => {
     ...trashLifecycleRegistrars,
     ...smtpRegistrars,
     ...replyForwardRegistrars,
+    registerSystemStatusTool,
   ];
 
-  it('is exactly 29 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3) + V5 (2) + V5.2 (4)', () => {
+  it('is exactly 30 tools, adding read-only mail_system_status to the prior 29', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(29);
-    expect(new Set(names).size).toBe(29); // no accidental duplicate names
+    expect(names).toHaveLength(30);
+    expect(new Set(names).size).toBe(30); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {

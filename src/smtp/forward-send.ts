@@ -29,6 +29,8 @@ export interface ForwardSendParams {
 export interface ForwardSendDeps {
   getPassword: () => Promise<string>;
   sendFn?: SmtpSendFn;
+  /** Test-only state isolation; production always uses the user's config directory. */
+  replayStateDir?: string;
   /** Test-only override of {@link LIVE_FORWARD_DISABLED} — see `src/smtp/reply-send.ts`'s identical `liveDisabled` for the rationale. */
   liveDisabled?: boolean;
 }
@@ -234,7 +236,12 @@ export async function sendForward(
 
   const receiptExpiresAt =
     Date.parse(receiptValidation.receipt.issuedAt) + FORWARD_INTENT_RECEIPT_TTL_MS;
-  const nonce = consumeReceiptNonce(`forward:${receiptValidation.receipt.id}`, receiptExpiresAt);
+  const nonce = consumeReceiptNonce(
+    `forward:${receiptValidation.receipt.id}`,
+    receiptExpiresAt,
+    Date.now(),
+    deps?.replayStateDir,
+  );
   if (!nonce.consumed) {
     return preSubmissionRejection(base, true, [
       ...validation.reasons,

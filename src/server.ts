@@ -25,9 +25,8 @@ import { registerTrashTool } from './tools/trash.js';
 import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
-
-const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.5.4';
+import { registerSystemStatusTool } from './tools/system-status.js';
+import { SERVER_NAME, SERVER_VERSION } from './version.js';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -157,9 +156,12 @@ const SERVER_VERSION = '0.5.4';
  * LIVE_REPLY_DISABLED remains false. The forward consent, signed receipt,
  * exact source/content/recipient/intro/attachment-state revalidation, and
  * nonce-before-SMTP ordering are unchanged. Real Bridge forward validation
- * is still pending and requires a full MCP process restart. No real forward
- * is sent in this implementation task. See src/smtp/feature-gates.ts and
+ * subsequently succeeded after a full MCP process restart. No real forward
+ * was sent in the gate-flip implementation task. See src/smtp/feature-gates.ts and
  * SECURITY.md ("Controlled live forward is enabled as of 0.5.4").
+ * 0.6.0 adds durable cross-process outbound receipt markers and a read-only
+ * mail_system_status runtime identity tool. The mailbox action surface is
+ * otherwise unchanged; permanent deletion remains live-disabled.
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -200,12 +202,16 @@ export function createServer(): McpServer {
   registerReplyTool(server);
   registerForwardPreviewTool(server);
   registerForwardTool(server);
+  registerSystemStatusTool(server);
 
   return server;
 }
 
 /** Starts the server over stdio, the only transport this project supports. */
 export async function startServer(): Promise<void> {
+  if (process.platform !== 'darwin') {
+    throw new Error('proton-mail-mcp 0.6.0 currently supports macOS only.');
+  }
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);

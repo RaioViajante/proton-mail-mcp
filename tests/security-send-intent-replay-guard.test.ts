@@ -1,6 +1,14 @@
+import { spawn, execFileSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  cleanupExpiredReplayMarkers,
   consumeReceiptNonce,
+  getReplayStateDir,
+  replayMarkerName,
   resetReplayGuardForTests,
 } from '../src/security/send-intent-replay-guard.js';
 
@@ -30,19 +38,14 @@ describe('consumeReceiptNonce', () => {
     expect(second.consumed).toBe(true);
   });
 
-  it('an id is eligible for pruning once its own expiry passes, and behaves as unconsumed again after being pruned', () => {
+  it('an expired receipt remains invalid; cleanup only removes an old marker after the safety margin', () => {
     const expiresAt = NOW + TTL_MS;
     consumeReceiptNonce('c'.repeat(32), expiresAt, NOW);
-    // Just before expiry: still refused (still tracked).
     const stillTracked = consumeReceiptNonce('c'.repeat(32), expiresAt, expiresAt - 1);
     expect(stillTracked.consumed).toBe(false);
-    // At/after its own expiry, the entry is pruned as stale bookkeeping —
-    // this is safe because the receipt itself would independently fail
-    // `validateSendIntentReceipt`'s own expiry check by then, so nothing
-    // can actually be replayed through this path; it only bounds this
-    // module's memory to the TTL window.
-    const afterExpiry = consumeReceiptNonce('c'.repeat(32), expiresAt, expiresAt + 1);
-    expect(afterExpiry.consumed).toBe(true);
+    expect(cleanupExpiredReplayMarkers(getReplayStateDir(), expiresAt + 1)).toBe(0);
+    expect(cleanupExpiredReplayMarkers(getReplayStateDir(), expiresAt + 60 * 60 * 1000)).toBe(1);
+    expect(() => consumeReceiptNonce('c'.repeat(32), expiresAt, expiresAt + 1)).toThrow();
   });
 
   it('resetReplayGuardForTests clears all in-memory state', () => {
@@ -50,6 +53,64 @@ describe('consumeReceiptNonce', () => {
     resetReplayGuardForTests();
     const result = consumeReceiptNonce('d'.repeat(32), NOW + TTL_MS, NOW);
     expect(result.consumed).toBe(true);
+  });
+});
+
+describe('durable replay state', () => {
+  beforeEach(() => resetReplayGuardForTests());
+
+  it('uses private files with no receipt or mail fields, and survives a new call context', () => {
+    const id = 'a1'.repeat(16);
+    const stateDir = getReplayStateDir();
+    expect(consumeReceiptNonce(id, NOW + TTL_MS, NOW).consumed).toBe(true);
+    const files = readdirSync(stateDir);
+    expect(files).toEqual([replayMarkerName(id)]);
+    expect(statSync(stateDir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(stateDir, files[0]!)).mode & 0o777).toBe(0o600);
+    const data = readFileSync(join(stateDir, files[0]!), 'utf8');
+    expect(data).not.toContain(id);
+    expect(data).not.toMatch(/recipient|subject|body|receipt|@/i);
+    expect(consumeReceiptNonce(id, NOW + TTL_MS, NOW + 1, stateDir).consumed).toBe(false);
+  });
+
+  it('a malformed or crash-style partial marker blocks reuse and is not cleaned', () => {
+    const id = 'b1'.repeat(16);
+    const stateDir = getReplayStateDir();
+    consumeReceiptNonce(id, NOW + TTL_MS, NOW);
+    const file = join(stateDir, replayMarkerName(id));
+    writeFileSync(file, '{', { mode: 0o600 });
+    expect(consumeReceiptNonce(id, NOW + TTL_MS, NOW + 1, stateDir).consumed).toBe(false);
+    expect(cleanupExpiredReplayMarkers(stateDir, NOW + TTL_MS + 10000000)).toBe(0);
+  });
+
+  it('only one independent Node process consumes the same receipt', async () => {
+    execFileSync('pnpm', ['build'], { stdio: 'ignore' });
+    const root = mkdtempSync(join(tmpdir(), 'replay-process-test-'));
+    const stateDir = join(root, 'replay');
+    const moduleUrl = pathToFileURL(
+      join(process.cwd(), 'dist/security/send-intent-replay-guard.js'),
+    ).href;
+    const code = `import { consumeReceiptNonce } from ${JSON.stringify(moduleUrl)};
+      await new Promise(resolve => setTimeout(resolve, 100));
+      process.stdout.write(String(consumeReceiptNonce('c1'.repeat(16), Date.now()+900000, Date.now(), process.argv[1]).consumed));`;
+    const run = () =>
+      new Promise<string>((resolve, reject) => {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', code, stateDir]);
+        let output = '';
+        child.stdout.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+        });
+        child.on('error', reject);
+        child.on('close', (exit) =>
+          exit === 0 ? resolve(output) : reject(new Error('child failed')),
+        );
+      });
+    try {
+      const results = await Promise.all([run(), run()]);
+      expect(results.sort()).toEqual(['false', 'true']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

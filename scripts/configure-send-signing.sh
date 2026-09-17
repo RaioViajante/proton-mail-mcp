@@ -27,7 +27,7 @@
 set -euo pipefail
 
 if [[ "$(uname -s)" != Darwin ]]; then
-  echo "This script supports macOS only (it stores the secret in the macOS Keychain)." >&2
+  echo "proton-mail-mcp 0.6.0 currently supports macOS only." >&2
   exit 1
 fi
 
@@ -67,7 +67,5 @@ else
 fi
 
 echo
-echo "Setup complete. mail_send_preview will now issue a signed sendIntentReceipt for"
-echo "an eligible intent. Live mail_send submission remains disabled by a separate"
-echo "feature gate regardless (see SECURITY.md, \"Live SMTP submission is"
-echo "feature-gated off\") until a future, explicitly authorized version."
+echo "Setup complete. mail_send_preview can issue signed receipts for eligible intents."
+echo "Live outbound submission still requires each tool's explicit consent and receipt gates."

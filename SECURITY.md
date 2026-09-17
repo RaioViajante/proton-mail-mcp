@@ -590,34 +590,52 @@ calling `mail_send` twice with the same still-valid receipt could otherwise subm
 twice over SMTP. This project's MCP server has no persistent database and this section is an explicit,
 narrow exception to that, not a quiet contradiction of it — see the decision below.
 
-**The decision**: `src/security/send-intent-replay-guard.ts` keeps a minimal, in-memory,
-process-lifetime map of already-consumed receipt `id`s, bounded to the TTL window (an entry is pruned
-once its own receipt would have expired anyway) and cleared on every process restart. `mail_send`
-consumes a receipt's `id` the moment it passes verification — before a credential is even requested —
-so a second call presenting the same receipt is refused regardless of what happened to the first
-attempt, including a clean connection failure that had zero chance of actually sending anything. This
-means **a `sendIntentReceipt` authorizes at most one submission _attempt_, ever — not one success**: a
-caller that wants to retry after ANY outcome (including `failed`/`uncertain`) must call
-`mail_send_preview` again for a fresh receipt.
+**0.6.0 decision:** `src/security/send-intent-replay-guard.ts` persists one marker per verified
+send, reply, or forward receipt under `~/.config/proton-mail-mcp/replay/`. Its filename is SHA-256 of
+the purpose, a NUL separator, and the random receipt nonce. It contains only a format version,
+purpose, consumption timestamp and expiry timestamp. It never stores a receipt, HMAC, recipient,
+subject, body, Message-ID, Bridge credential, or signing key. The config and replay directories must
+be owner-only (0700); marker files are 0600.
 
-**What this explicitly does NOT protect against** — stated, not hidden:
+The decision is one `O_CREAT|O_EXCL` file creation, not a raceable exists-then-create sequence.
+Two independent MCP processes, including one launched by Codex and one by Claude Code, cannot
+consume the same marker. Namespace separation prevents identical random nonces in send, reply and
+forward from colliding. A non-collision filesystem error fails closed before credential lookup or
+SMTP. A partially written marker still counts as consumed.
 
-- **A server restart.** A receipt consumed just before a restart is, from the guard's point of view,
-  unconsumed again afterwards. The remaining TTL still bounds the exposure window, but a restart within
-  it resets the guard.
-- **Two server processes running concurrently** against the same Bridge account and the same
-  Keychain-provisioned signing secret. Each process keeps its own in-memory map; neither knows about
-  the other's consumption. Running more than one instance of this server against the same account is
-  out of scope for 0.5.1 and is a real, accepted gap, not something this guard claims to solve.
+This is **at-most-once authorization, not exactly-once delivery**. If a process crashes after
+exclusive creation but before SMTP, the receipt stays spent; it is never rolled back. That can lose
+one authorized attempt, but avoids a duplicate send. The guard does not automatically retry any
+outcome. Lazy cleanup examines at most 64 marker entries per consumption and deletes only valid,
+private markers whose signed receipt expiry passed at least one additional hour ago. Malformed or
+partial markers remain. Cleanup failure cannot authorize a replay or block a successful new
+consumption. This protection applies only to outbound receipts; unrelated IMAP mutations are not
+globally serialized or transactional.
 
-**Why not a persistent store instead**: a heavier fix (a local database of consumed receipts,
-durable across restarts and processes) was considered and rejected for 0.5.1 as disproportionate to
-the threat — this project's realistic replay scenario is a single Claude Code session's MCP process
-retrying the same tool call, which the in-memory guard already closes, combined with the receipt's own
-short (15-minute) TTL bounding the blast radius of every gap listed above. This is a deliberate,
-documented trade-off, not an oversight — if it stops being adequate (e.g. multi-instance deployment
-becomes a real use case), replace this module's map with a durable store rather than papering over the
-gap silently.
+The guarantee assumes every participating MCP process runs 0.6.0 and uses the same local config
+directory. During upgrade, restart both Codex and Claude Code MCP processes. A receipt consumed by
+the old in-memory guard before upgrade has no file marker; let its 15-minute TTL expire before
+relying on the new cross-process guarantee. `mail_system_status` confirms the loaded version in
+each process.
+
+## Operational recovery and diagnostics (0.6.0)
+
+0.6.0 officially supports macOS only. Runtime startup, bootstrap, and doctor reject unsupported
+platforms clearly; Linux and Windows credential stores or setup flows have not been implemented.
+The bootstrap trust boundary is local: `scripts/bootstrap.sh` reuses the existing setup scripts,
+which accept only Bridge-generated credentials, local connection settings and the exported public
+certificate. It never asks for a Proton account password, recovery phrase, or recovery codes.
+Bridge credentials and signing secrets stay in macOS Keychain, not Git, agent configuration or
+`config.json`. Bootstrap prints Codex and Claude Code registration commands but never runs them
+or overwrites an existing agent registration. `--check` makes no configuration changes.
+
+`pnpm doctor` is read-only. It checks config, file permissions, Keychain availability and a
+read-only IMAP connection. It deliberately does not verify SMTP: no SMTP connection, DATA, recipient
+or message is sent. Errors are converted to fixed status text so raw Keychain output, parser input,
+paths and protocol transcripts are not printed. `mail_system_status` exposes the loaded server
+name/version, process start and uptime, coarse configuration and gate status. It never reads
+Keychain values or message content, and makes no Bridge connection. A reported capability means
+its code gate is open; doctor supplies the separate environment health checks.
 
 ## Duplicate sends are worse than an uncertain result
 
@@ -651,8 +669,8 @@ guess coded in ahead of that observation.
 loopback-only transport and every 0.5.0/0.5.1 protection, plus the additional threat surface reply
 and forward introduce by deriving parts of the outbound message from an attacker-controlled source
 message. Live submission for both was feature-gated off in 0.5.2. Controlled live reply was enabled
-and separately validated in 0.5.3; controlled live forward is enabled in 0.5.4, with real Bridge
-validation still pending after a full MCP process restart. The threat models below apply to both.
+and separately validated in 0.5.3; controlled live forward was enabled in 0.5.4 and separately
+validated after a full MCP process restart. The threat models below apply to both.
 
 **Malicious `Reply-To`.** A sender fully controls their own `Reply-To` header. The threat: an
 attacker sets `Reply-To` to a third party, or to multiple addresses, hoping a reply silently goes
@@ -747,8 +765,8 @@ could never let one type's consumption record satisfy another's. See
 `LIVE_REPLY_DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) started 0.5.2 both
 unconditionally `true` — no config flag or environment variable. 0.5.3 flipped only the reply gate;
 separate real Bridge validation later confirmed one accepted reply, one Sent copy, one Inbox copy,
-and matching threading headers. **0.5.4 flips only the forward gate.** Real forward validation is
-still pending until a full MCP process restart; this implementation task sends no real forward.
+and matching threading headers. **0.5.4 flips only the forward gate.** A later controlled validation
+after a full restart confirmed one accepted forward and one copy each in Sent and INBOX.
 No 0.5.2 forward protection was relaxed: consent, HMAC and TTL verification, exact source
 fingerprint/recipient/subject/intro hash/forwarded-content hash/attachment-state match, fresh source
 re-fetch and re-derivation, attachment-omission acknowledgement when needed, and nonce consumption
@@ -767,7 +785,7 @@ heavily-restricted set: the single outbound HTTPS request `mail_unsubscribe` may
 side effect" above), and — as of 0.5.1 — the loopback-only, receipt-gated, at-most-once-per-attempt SMTP
 connection `mail_send` makes on a fully-confirmed live call (see "Live SMTP submission (0.5.1)"). As of
 0.5.3, `mail_reply` shares that same connection path and has been live-validated. As of 0.5.4,
-`mail_forward` is enabled in code, with separate real Bridge validation pending after restart (see
+`mail_forward` is enabled and was separately live-validated after restart (see
 "Controlled live forward is enabled as of 0.5.4" above). If you fork or extend it and find a
 security issue, treat it with the same care as the points above: prefer removing a footgun over
 rationalizing it.

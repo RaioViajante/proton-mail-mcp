@@ -5,8 +5,8 @@
  * gated off before 0.5.1 live-validated and lifted it.
  *
  * 0.5.3 lifted `LIVE_REPLY_DISABLED`; its live Bridge validation succeeded.
- * 0.5.4 lifts only `LIVE_FORWARD_DISABLED`. Real forward validation remains
- * pending until a full MCP process restart. Consent, receipt verification,
+ * 0.5.4 lifts only `LIVE_FORWARD_DISABLED`. Separate real Bridge forward
+ * validation later succeeded after a full MCP process restart. Consent, receipt verification,
  * source revalidation, and nonce consumption before SMTP remain in place.
  *
  * See `src/smtp/reply-send.ts`/`forward-send.ts` for exactly where each gate

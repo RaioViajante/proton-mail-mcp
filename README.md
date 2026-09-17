@@ -1,6 +1,6 @@
 # proton-mail-mcp
 
-A local MCP server that lets Claude Code work with your Proton Mail account through
+A local MCP server that lets Codex and Claude Code work with your Proton Mail account through
 [Proton Mail Bridge](https://proton.me/mail/bridge)'s local IMAP interface: read mail (V1), triage it as of
 V2 — mark read/unread, archive, move, mark as spam, apply/remove labels, and create folders — as of
 V3 (0.3.0), unsubscribe from a mailing list through exactly one narrow, standards-based, consent-gated
@@ -31,7 +31,7 @@ Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-04
   tokens. See ["Why the Bridge password, not your Proton Account
   password"](#why-the-bridge-password-not-your-proton-account-password).
 - **The Bridge password lives only in the macOS Keychain.** It is never in source code, never in Git, never
-  in the Claude Code MCP configuration, never in a committed `.env` file, and never printed to a log.
+  in agent MCP configuration, never in a committed `.env` file, and never printed to a log.
 - **Real TLS validation, no shortcuts.** The server trusts Bridge's own self-signed certificate, supplied as
   a local, unversioned file. `rejectUnauthorized` is never disabled.
 - **Read-only IMAP for V1.** Every V1 tool opens its mailbox with `readOnly: true`. Listing or reading a
@@ -44,10 +44,9 @@ Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-04
   adds `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` —
   implemented and fully unit-tested, but its live execution is still unconditionally refused by a hard
   feature gate; see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040-hardened-in-041-durable-receipts-in-042).
-- **Controlled live SMTP send, as of 0.5.1.** `mail_send`/`mail_send_preview` (V5, 0.5.0) are this project's
-  only SMTP capability — loopback-only Bridge transport, plain-text/explicit-recipients only, sender locked
-  to the configured account identity, a signed single-use receipt required for every live call, and no
-  reply/forward tool of any kind. See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
+- **Controlled outbound mail.** Send, reply, and forward use the loopback-only Bridge transport,
+  plain text, explicit consent, and signed single-use receipts. 0.6.0 stores replay markers across
+  MCP processes and restarts. See ["V5 — SMTP Send Foundation"](#v5--smtp-send-foundation-050).
 - **Email content is always labeled untrusted, and can never drive a mutation.** See ["Threat
   model"](#threat-model-prompt-injection-via-email).
 
@@ -58,7 +57,8 @@ See [SECURITY.md](SECURITY.md) for the condensed version of these rules.
 ```
 src/
   index.ts              # process entry point; starts the server over stdio
-  server.ts              # builds the McpServer and registers all 25 tools
+  server.ts              # builds the McpServer and registers all 30 tools
+  doctor.ts              # read-only diagnostic CLI
   bridge/
     client.ts            # opens/closes a Bridge IMAP connection
     config.ts            # non-secret config file + macOS Keychain password/secret lookups (IMAP + SMTP)
@@ -109,10 +109,11 @@ src/
     untrusted-content.ts       # labels + bounds any text pulled from an email
     restore-receipt.ts          # V4 (0.4.2): signed pre-Trash snapshot receipts
     send-intent-receipt.ts       # V5 (0.5.0): signed preview->send intent receipts
-    send-intent-replay-guard.ts   # V5.1 (0.5.1): in-memory single-use receipt nonce, bounds replay
+    send-intent-replay-guard.ts   # 0.6.0: durable cross-process single-use receipt markers
 
 tests/                    # Vitest; no live IMAP connection, no live HTTP to a real mailing list, no live SMTP, see "Development commands"
 scripts/
+  bootstrap.sh                      # macOS recovery/setup orchestration and --check mode
   configure-bridge.sh              # one-time manual setup: Keychain + non-secret config (IMAP + SMTP, 0.5.0)
   configure-receipt-signing.sh     # optional (0.4.2): provisions the restore-receipt HMAC signing secret
   configure-send-signing.sh        # optional (0.5.0): provisions the send-intent-receipt HMAC signing secret
@@ -123,7 +124,7 @@ long-lived shared session to reason about or leak.
 
 ## Prerequisites
 
-- macOS (the Keychain integration is macOS-specific).
+- macOS only in 0.6.0 (the Keychain integration and bootstrap are macOS-specific).
 - [Homebrew](https://brew.sh).
 - Node.js ≥ 24 and [pnpm](https://pnpm.io) (`brew install node@24 pnpm`, or via your existing dotfiles'
   Brewfile).
@@ -1233,18 +1234,14 @@ adding, removing, or moving an address between `to`/`cc` always does. Every rece
 random signed nonce (`id`) — see "Send-intent receipt replay" below. See SECURITY.md ("Send-intent
 receipts", "Send-intent receipt replay") for the full design.
 
-### Send-intent receipt replay (0.5.1)
+### Durable outbound receipt replay protection (0.6.0)
 
-A receipt is valid for its full 15-minute TTL, so on its own it could be presented to `mail_send` more
-than once. `src/security/send-intent-replay-guard.ts` closes the realistic case of this (a caller or
-client re-invoking the same live tool call within one server process's lifetime) with a minimal,
-in-memory, single-use marker per receipt `id` — consumed the instant a receipt verifies, before a
-credential is even requested. This makes a receipt authorize **at most one submission attempt, ever,
-not one success**: any retry, after any outcome, needs a fresh `mail_send_preview` call. This does not
-survive a server restart and does not coordinate across multiple concurrently-running server processes
-— an explicit, documented, accepted limitation, not a claimed guarantee beyond what it actually
-provides. See SECURITY.md ("Send-intent receipt replay") for the full reasoning, including why a
-heavier persistent store was considered and rejected for this version.
+A receipt can be valid for 15 minutes. Send, reply, and forward now consume an atomic marker under
+`~/.config/proton-mail-mcp/replay/` before credential lookup or SMTP. The marker survives restarts and
+coordinates Codex and Claude Code processes on the same Mac. The receipt authorizes **at most one
+submission attempt, not exactly-once delivery**. A crash after marker creation leaves it consumed.
+Markers contain only purpose and timestamps; filenames are SHA-256 of the purpose and random nonce.
+Expired markers are cleaned lazily after an additional one-hour margin. See SECURITY.md.
 
 ### Sender, recipient, subject, body policy
 
@@ -1280,7 +1277,7 @@ Four tools built on top of the same, already-validated SMTP transport: `mail_rep
 `mail_reply` and `mail_forward_preview`/`mail_forward`. As with `mail_send` in 0.5.0/0.5.1, live
 submission shipped **unconditionally feature-gated off** in 0.5.2 (`src/smtp/feature-gates.ts`).
 0.5.3 enabled and subsequently live-validated controlled reply. 0.5.4 enables controlled live
-forward in code; real Bridge validation remains pending until a full MCP process restart. Preview
+forward in code; its separate real Bridge validation subsequently passed. Preview
 and dry-run remain fully functional.
 
 ### No reply-all, ever
@@ -1407,8 +1404,9 @@ as `mail_send`'s receipt-match check.
 `LIVE_REPLY_DISABLED`/`LIVE_FORWARD_DISABLED` (`src/smtp/feature-gates.ts`) both started 0.5.2
 unconditionally `true`. 0.5.3 flipped only `LIVE_REPLY_DISABLED` to `false`; its separate real
 Bridge validation succeeded. **0.5.4 flips only `LIVE_FORWARD_DISABLED` to `false`.** Real forward
-validation is still pending and must follow a full MCP process restart. No real forward is sent by
-the 0.5.4 implementation task. Consent, full receipt verification, source revalidation immediately
+validation subsequently passed after a full MCP process restart with one accepted SMTP attempt and
+one observed Sent and Inbox copy. No real forward was sent by the 0.5.4 implementation task. Consent,
+full receipt verification, source revalidation immediately
 before submission, attachment-omission acknowledgement, and nonce consumption before SMTP remain
 in force. The feature-gate check still precedes nonce consumption: a gate-blocked call leaves the
 receipt usable because no external attempt occurred.
@@ -1460,25 +1458,66 @@ If you extend this project with any tool that takes a broader action (a search-b
 automation, or reply/forward built on top of the 0.5.0 SMTP transport), treat every value derived from email
 content as hostile input to that action, and re-read this section first.
 
-## Claude Code integration
+## Codex and Claude Code integration
 
-Register the server via the Claude Code CLI — this only tells Claude Code how to _start_ the process; it does
+Register the server via either agent CLI — this only tells the agent how to _start_ the process; it does
 not need, and must never be given, any credential. The running server retrieves its own configuration and
 password from `~/.config/proton-mail-mcp/config.json` and the macOS Keychain.
 
-After `pnpm build` has produced `dist/index.js`, and after `scripts/configure-bridge.sh` has been run:
+After bootstrap and doctor pass, run the commands printed by `./scripts/bootstrap.sh --check`.
+The installed CLI help is checked before commands are printed. On the currently tested CLI versions,
+the commands have this form (substitute absolute paths):
 
+```bash
+codex mcp add proton-mail-mcp -- /absolute/path/to/node /absolute/path/to/proton-mail-mcp/dist/index.js
+claude mcp add -s user proton-mail-mcp -- /absolute/path/to/node /absolute/path/to/proton-mail-mcp/dist/index.js
 ```
-claude mcp add --scope user proton-mail node /path/to/proton-mail-mcp/dist/index.js
-```
 
-- `--scope user` makes it available in every project on this machine, not just one repo. For testing, a more
-  restrictive `--scope local` (private to you, scoped to the current project directory) works too.
-- No `-e` / environment variables and no header/token flags — there is nothing secret to pass.
+- Claude's `-s user` makes it available in every project on this machine.
+- No environment secrets or token flags are passed. Review existing registrations before adding one;
+  bootstrap never changes agent configuration.
 
-Verify it's registered, connects, and exposes all 25 tools:
+Verify registration and call `mail_system_status` to see the **loaded** server version. The server
+registers 30 tools in 0.6.0. Both agents may share this repository, config, Keychain credentials and
+Bridge. The durable replay markers reject the same outbound receipt across both agents, even after a
+restart. Avoid deliberately racing agents against the mailbox: unrelated IMAP mutations are not
+globally transactional. After upgrading, restart **both** MCP processes and use `mail_system_status`
+in each to confirm 0.6.0; receipts consumed by an older in-memory guard before upgrade have no
+durable marker, so let their 15-minute TTL expire before relying on the new cross-process guarantee.
 
-```
+```bash
+codex mcp list
 claude mcp list
-claude mcp get proton-mail
+claude mcp get proton-mail-mcp
 ```
+
+## Fresh Mac / Recovery
+
+Cloning alone is **not sufficient**. Config, Bridge credentials, TLS certificate and signing secrets
+are intentionally excluded from Git. On a fresh Mac:
+
+1. Clone this private repository and enter it.
+2. Install Node >=24 and pnpm 12, then run `./scripts/bootstrap.sh`. Use `--check` for a read-only
+   inventory.
+3. Install and sign in to Proton Mail Bridge. Open Bridge's **Mailbox details** for the
+   Bridge-generated username, password and local ports. Never enter your Proton account password,
+   recovery phrase or recovery codes into this project.
+4. Export Bridge's public TLS certificate. Bootstrap invokes the existing Bridge setup script when
+   config or credential is missing; it uses hidden password input and macOS Keychain.
+5. Bootstrap reuses the restore and send signing setup scripts only when those secrets are missing
+   or invalid, installs dependencies, builds TypeScript, creates private replay state, and runs doctor.
+6. Run `pnpm doctor` (or `node dist/doctor.js --json`). Exit code 0 means no essential check failed;
+   1 means at least one FAIL. WARN and NOT_CHECKED are visible but do not themselves fail the command.
+7. Review the printed Codex and Claude Code registration commands. Use absolute Node and entrypoint
+   paths. Make a read-only smoke test with `mail_system_status` and `mail_list_folders`.
+
+Doctor reads config and Keychain presence, checks permissions and opens a read-only IMAP connection.
+It never sends an email, opens an SMTP session, changes mailbox state, or deletes replay markers.
+`mail_system_status` performs only local config/state inspection; its `bridgeConnectivity` field is
+`notChecked`. Both commands suppress secret values and raw dependency errors.
+
+### Roadmap: cross-platform support
+
+Linux and Windows are future work, not supported in 0.6.0. An issue for that work should cover Linux
+Secret Service/KWallet, Windows Credential Manager, platform-specific bootstrap, and Bridge
+installation differences. No cross-platform implementation is included in this release.

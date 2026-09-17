@@ -26,6 +26,8 @@ export interface ReplySendParams {
 export interface ReplySendDeps {
   getPassword: () => Promise<string>;
   sendFn?: SmtpSendFn;
+  /** Test-only state isolation; production always uses the user's config directory. */
+  replayStateDir?: string;
   /**
    * Test-only override of {@link LIVE_REPLY_DISABLED}. Production callers
    * (`src/tools/reply.ts`) never set this — it exists purely so the
@@ -240,7 +242,12 @@ export async function sendReply(
 
   const receiptExpiresAt =
     Date.parse(receiptValidation.receipt.issuedAt) + REPLY_INTENT_RECEIPT_TTL_MS;
-  const nonce = consumeReceiptNonce(`reply:${receiptValidation.receipt.id}`, receiptExpiresAt);
+  const nonce = consumeReceiptNonce(
+    `reply:${receiptValidation.receipt.id}`,
+    receiptExpiresAt,
+    Date.now(),
+    deps?.replayStateDir,
+  );
   if (!nonce.consumed) {
     return preSubmissionRejection(base, true, [
       ...validation.reasons,

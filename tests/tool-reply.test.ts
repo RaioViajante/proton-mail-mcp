@@ -6,6 +6,7 @@ import { registerReplyPreviewTool } from '../src/tools/reply-preview.js';
 import { registerReplyTool } from '../src/tools/reply.js';
 import type { ReplyPreviewResult } from '../src/smtp/reply-preview.js';
 import type { ReplySendResult } from '../src/smtp/reply-send.js';
+import { resetReplayGuardForTests } from '../src/security/send-intent-replay-guard.js';
 import { asImapFlow, createFakeImapClient } from './fakes/imap-client.js';
 
 function parsePreview(result: { content: { text: string }[] }): ReplyPreviewResult {
@@ -39,6 +40,7 @@ vi.mock('../src/bridge/config.js', () => bridgeConfig);
 type Handler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
 
 function registerHandlers(): Map<string, Handler> {
+  resetReplayGuardForTests();
   const handlers = new Map<string, Handler>();
   const fakeServer = {
     registerTool: vi.fn((name: string, _cfg: unknown, handler: Handler) => {

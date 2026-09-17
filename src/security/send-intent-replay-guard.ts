@@ -1,98 +1,193 @@
-/**
- * Send-intent receipt replay guard (0.5.1).
- *
- * ## The problem
- *
- * A `sendIntentReceipt` is valid for its full
- * `SEND_INTENT_RECEIPT_TTL_MS` (15 minutes) window and, on its own, can be
- * presented to `mail_send` more than once — nothing about signature/expiry/
- * intent-match verification (`src/security/send-intent-receipt.ts`) detects
- * "this exact receipt already caused a submission". A caller retrying the
- * same live `mail_send` call (double-click, a buggy client, a compromised
- * intermediate step) with the same receipt could otherwise submit the same
- * message twice over SMTP.
- *
- * ## The decision (explicit, not implied)
- *
- * This project's MCP server process is genuinely stateless between restarts
- * — no database, no file-backed session store — but it *is* one long-running
- * process for the lifetime of one Claude Code session, and that lifetime is
- * exactly the window a real replay is most likely to happen in (an agent or
- * user re-invoking the same tool call). A minimal, auditable, in-memory
- * single-use marker for each receipt's `id` closes that real-world case
- * without introducing a persistent database. This module is deliberately
- * that and nothing more: a `Map` keyed by the receipt's random nonce,
- * bounded to the TTL window, cleared on every process restart.
- *
- * ## What this does NOT protect against (stated, not hidden)
- *
- * - **A server restart.** A receipt consumed just before a restart is, from
- *   this module's point of view, unconsumed again afterwards. The signature/
- *   expiry checks still bound the damage to the remaining TTL window, but
- *   within that window a restart resets this guard.
- * - **Two server processes running concurrently** against the same Bridge
- *   account and the same Keychain-provisioned signing secret (e.g. two
- *   separate Claude Code sessions each spawning their own MCP process). Each
- *   process has its own in-memory map; neither knows about the other's
- *   consumption. This is a real, accepted gap — see SECURITY.md
- *   ("Send-intent receipt replay") — not something this module claims to
- *   solve. Running more than one instance of this server against the same
- *   account is out of scope for 0.5.1.
- *
- * This is why `mail_send`'s live path treats a receipt as authorizing **at
- * most one submission attempt, ever** (not one success): the id is consumed
- * the moment receipt verification passes, before any SMTP connection is
- * even attempted, so a second call with the same receipt is refused
- * regardless of what happened to the first attempt. A caller that wants to
- * retry after any outcome — including a `failed`/`uncertain` one — must call
- * `mail_send_preview` again for a fresh receipt. See SECURITY.md ("Duplicate
- * sends are worse than an uncertain result") for why this project accepts
- * that inconvenience over the alternative.
- */
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { getConfigDir } from '../bridge/config.js';
 
-interface ConsumedEntry {
-  /** Absolute ms timestamp after which this entry may be pruned — always `issuedAt + SEND_INTENT_RECEIPT_TTL_MS`, i.e. exactly when the receipt itself would have expired anyway. */
-  expiresAt: number;
+/** One hour beyond the receipt expiry, to tolerate clock skew during cleanup. */
+export const REPLAY_CLEANUP_MARGIN_MS = 60 * 60 * 1000;
+const CLEANUP_SCAN_LIMIT = 64;
+const MARKER_VERSION = 1;
+type Purpose = 'send' | 'reply' | 'forward';
+
+let testStateDir: string | undefined;
+let cleanupOffset = 0;
+
+export function getReplayStateDir(): string {
+  return testStateDir ?? join(getConfigDir(), 'replay');
 }
 
-/** Module-level, in-memory, per-process only — see the module doc above for exactly what this does and does not guarantee. */
-const consumedReceiptIds = new Map<string, ConsumedEntry>();
+function splitKey(key: string): { purpose: Purpose; nonce: string } {
+  if (key.startsWith('reply:')) return { purpose: 'reply', nonce: key.slice(6) };
+  if (key.startsWith('forward:')) return { purpose: 'forward', nonce: key.slice(8) };
+  return { purpose: 'send', nonce: key };
+}
 
-function pruneExpired(now: number): void {
-  for (const [id, entry] of consumedReceiptIds) {
-    if (entry.expiresAt <= now) {
-      consumedReceiptIds.delete(id);
-    }
+export function replayMarkerName(key: string): string {
+  const { purpose, nonce } = splitKey(key);
+  if (!/^[0-9a-f]{32}$/i.test(nonce)) throw new Error('Invalid replay nonce.');
+  return createHash('sha256').update(purpose).update('\0').update(nonce).digest('hex');
+}
+
+function assertPrivateDirectory(path: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+    throw new Error('Replay state directory is not private.');
+  }
+  if (process.getuid && stat.uid !== process.getuid()) {
+    throw new Error('Replay state directory is not owned by this user.');
   }
 }
 
+function ensureReplayDirectory(stateDir: string): void {
+  const parent = dirname(stateDir);
+  if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
+  assertPrivateDirectory(parent);
+  try {
+    mkdirSync(stateDir, { mode: 0o700 });
+  } catch (error) {
+    if ((error as { code?: string }).code !== 'EEXIST') throw error;
+  }
+  assertPrivateDirectory(stateDir);
+}
+
+/** Read-only state availability check for doctor and mail_system_status. */
+export function replayStateAvailable(stateDir: string = getReplayStateDir()): boolean {
+  try {
+    assertPrivateDirectory(dirname(stateDir));
+    assertPrivateDirectory(stateDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface Marker {
+  version: number;
+  purpose: Purpose;
+  consumedAt: number;
+  expiresAt: number;
+}
+
+/** Best-effort, bounded, lazy cleanup. Malformed and partial markers remain consumed. */
+export function cleanupExpiredReplayMarkers(
+  stateDir: string = getReplayStateDir(),
+  now: number = Date.now(),
+): number {
+  assertPrivateDirectory(stateDir);
+  let removed = 0;
+  const entries = readdirSync(stateDir, { withFileTypes: true });
+  if (entries.length === 0) return 0;
+  const start = cleanupOffset % entries.length;
+  const count = Math.min(CLEANUP_SCAN_LIMIT, entries.length);
+  cleanupOffset = (start + count) % entries.length;
+  for (let inspected = 0; inspected < count; inspected++) {
+    const entry = entries[(start + inspected) % entries.length]!;
+    if (!entry.isFile() || !/^[0-9a-f]{64}$/.test(entry.name)) continue;
+    const path = join(stateDir, entry.name);
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) continue;
+      const marker = JSON.parse(readFileSync(path, 'utf8')) as Marker;
+      if (
+        marker.version !== MARKER_VERSION ||
+        !['send', 'reply', 'forward'].includes(marker.purpose) ||
+        !Number.isFinite(marker.expiresAt) ||
+        !Number.isFinite(marker.consumedAt) ||
+        marker.expiresAt + REPLAY_CLEANUP_MARGIN_MS > now
+      )
+        continue;
+      unlinkSync(path);
+      removed++;
+    } catch {
+      // Incomplete, malformed, or concurrently changed markers are left in place.
+    }
+  }
+  return removed;
+}
+
 export interface ReceiptNonceConsumption {
-  /** True the first (and only ever) time a given `id` is presented; false on any subsequent attempt with the same `id`. */
   consumed: boolean;
 }
 
 /**
- * Atomically checks-and-marks one receipt id as used. Synchronous and
- * side-effect-free beyond the module-level map, so there is no `await`
- * between the check and the mark — no window for a concurrent call to race
- * past it. Call this exactly once, right after a `sendIntentReceipt` passes
- * every other validation check, and before doing anything else toward a
- * live SMTP submission.
+ * Exclusive file creation is the only consume decision. A marker remains spent
+ * even if writing/fsync fails or the process crashes before SMTP: at-most-once
+ * authorization, not exactly-once delivery. No rollback is attempted.
  */
 export function consumeReceiptNonce(
   id: string,
   expiresAt: number,
   now: number = Date.now(),
+  stateDir: string = getReplayStateDir(),
 ): ReceiptNonceConsumption {
-  pruneExpired(now);
-  if (consumedReceiptIds.has(id)) {
-    return { consumed: false };
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    throw new Error('Replay receipt expiry is invalid.');
   }
-  consumedReceiptIds.set(id, { expiresAt });
+  const { purpose } = splitKey(id);
+  const filename = replayMarkerName(id);
+  ensureReplayDirectory(stateDir);
+  const path = join(stateDir, filename);
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error) {
+    if ((error as { code?: string }).code === 'EEXIST') return { consumed: false };
+    // Discard the OS error path so tool responses never reveal local state paths.
+    // eslint-disable-next-line preserve-caught-error -- deliberately sanitized
+    throw new Error('Could not atomically consume outbound receipt.');
+  }
+  try {
+    const marker: Marker = { version: MARKER_VERSION, purpose, consumedAt: now, expiresAt };
+    writeFileSync(fd, JSON.stringify(marker));
+    fsyncSync(fd);
+  } catch {
+    throw new Error('Outbound receipt marker could not be persisted; receipt remains consumed.');
+  } finally {
+    closeSync(fd);
+  }
+  // Persist directory entry before any credential/SMTP work. Failure leaves
+  // the exclusive marker in place and refuses this attempt.
+  let directoryFd: number | undefined;
+  try {
+    directoryFd = openSync(stateDir, constants.O_RDONLY);
+    fsyncSync(directoryFd);
+  } catch {
+    throw new Error('Outbound receipt directory could not be persisted; receipt remains consumed.');
+  } finally {
+    if (directoryFd !== undefined) closeSync(directoryFd);
+  }
+  // Cleanup is never a condition for a valid new authorization.
+  try {
+    cleanupExpiredReplayMarkers(stateDir, now);
+  } catch {
+    // Retry lazily on a later consume.
+  }
   return { consumed: true };
 }
 
-/** Test-only: clears all in-memory state so tests never leak consumption across cases. Never called from production code. */
+/** Test-only isolation: each test gets a new private state directory. */
 export function resetReplayGuardForTests(): void {
-  consumedReceiptIds.clear();
+  if (testStateDir) rmSync(dirname(testStateDir), { recursive: true, force: true });
+  const root = join(tmpdir(), `proton-mail-mcp-replay-${process.pid}-${Date.now()}`);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  testStateDir = join(root, 'replay');
+  cleanupOffset = 0;
 }

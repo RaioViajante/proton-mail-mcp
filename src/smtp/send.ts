@@ -31,6 +31,8 @@ export interface SendMailDeps {
   getPassword: () => Promise<string>;
   /** Test seam only — see `src/smtp/transport.ts`'s `SmtpSendFn`. Omitted in production, where `submitSmtp` uses the real nodemailer transport. */
   sendFn?: SmtpSendFn;
+  /** Test-only state isolation; production always uses the user's config directory. */
+  replayStateDir?: string;
 }
 
 export interface SendResult {
@@ -202,7 +204,12 @@ export async function sendMail(
   // and does not guarantee.
   const receiptExpiresAt =
     Date.parse(receiptValidation.receipt.issuedAt) + SEND_INTENT_RECEIPT_TTL_MS;
-  const nonce = consumeReceiptNonce(receiptValidation.receipt.id, receiptExpiresAt);
+  const nonce = consumeReceiptNonce(
+    receiptValidation.receipt.id,
+    receiptExpiresAt,
+    Date.now(),
+    deps?.replayStateDir,
+  );
   if (!nonce.consumed) {
     return preSubmissionRejection(base, true, [
       ...validation.reasons,

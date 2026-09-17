@@ -24,7 +24,7 @@
 set -euo pipefail
 
 if [[ "$(uname -s)" != Darwin ]]; then
-  echo "This script supports macOS only (it stores the password in the macOS Keychain)." >&2
+  echo "proton-mail-mcp 0.6.0 currently supports macOS only." >&2
   exit 1
 fi
 

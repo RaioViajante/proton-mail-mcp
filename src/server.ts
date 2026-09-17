@@ -4,6 +4,7 @@ import { registerApplyLabelTool } from './tools/apply-label.js';
 import { registerArchiveTool } from './tools/archive.js';
 import { registerCreateFolderTool } from './tools/create-folder.js';
 import { registerCreateLabelTool } from './tools/create-label.js';
+import { registerDeletePermanentlyTool } from './tools/delete-permanently.js';
 import { registerGetMessageTool } from './tools/get-message.js';
 import { registerListFoldersTool } from './tools/list-folders.js';
 import { registerListMessagesTool } from './tools/list-messages.js';
@@ -12,13 +13,15 @@ import { registerMarkSpamTool } from './tools/mark-spam.js';
 import { registerMarkUnreadTool } from './tools/mark-unread.js';
 import { registerMoveTool } from './tools/move.js';
 import { registerRemoveLabelTool } from './tools/remove-label.js';
+import { registerRestoreFromTrashTool } from './tools/restore-from-trash.js';
 import { registerSearchMailTool } from './tools/search-mail.js';
+import { registerTrashTool } from './tools/trash.js';
 import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 
 const SERVER_NAME = 'proton-mail-mcp';
-const SERVER_VERSION = '0.3.0';
+const SERVER_VERSION = '0.4.0';
 
 /**
  * Builds the MCP server and registers every tool.
@@ -40,6 +43,17 @@ const SERVER_VERSION = '0.3.0';
  * mechanism for one explicit UID at a time — never mailto, never a body
  * link, never browser automation. See src/unsubscribe/ and SECURITY.md
  * ("External HTTP side effect").
+ * V4 (0.4.0, "Safe Trash Lifecycle") adds mail_trash (readOnlyHint: false,
+ * destructiveHint: true — recoverable but a real mailbox-state change with
+ * an observed label-loss side effect), mail_restore_from_trash
+ * (readOnlyHint: false, destructiveHint: false), and mail_delete_permanently
+ * (readOnlyHint: false, destructiveHint: true). mail_delete_permanently is
+ * implemented and fully unit-tested — dry-run, batch limits, the
+ * confirm/acknowledge/confirmationPhrase gate — but live execution
+ * (dryRun: false) is unconditionally refused by a hard feature gate
+ * (blocked: true, blockReason: "livePermanentDeleteDisabled") before any
+ * IMAP mutating command runs; see src/mutations/permanent-delete.ts and
+ * SECURITY.md ("Permanent delete is feature-gated off in 0.4.0").
  * Do not add a tool here without updating README.md's "V2 mutation limitations"
  * and SECURITY.md.
  */
@@ -68,6 +82,10 @@ export function createServer(): McpServer {
 
   registerUnsubscribePreviewTool(server);
   registerUnsubscribeTool(server);
+
+  registerTrashTool(server);
+  registerRestoreFromTrashTool(server);
+  registerDeletePermanentlyTool(server);
 
   return server;
 }

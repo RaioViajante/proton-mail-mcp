@@ -48,10 +48,11 @@ sends a `mailto:` unsubscribe request for exactly this reason: doing so would me
 the first time ever from this project. It detects and reports a `mailto:`-only mechanism in
 `mail_unsubscribe_preview`, but never executes it — see "External HTTP side effect" below.
 
-## No destructive IMAP commands, ever
+## No destructive IMAP commands are ever reachable in 0.4.0
 
-There is no code path that issues DELETE, EXPUNGE, or permanent removal of a message, in V1 or
-V2. V1 opens every mailbox with `readOnly: true`; listing or reading a message never sets `\Seen`.
+There is no code path that issues EXPUNGE, or permanently removes a message, anywhere this project can
+actually be driven from in 0.4.0. V1 opens every mailbox with `readOnly: true`; listing or reading a message
+never sets `\Seen`.
 
 V2 (see README.md "Mutation model") adds STORE (flag changes), MOVE, and CREATE — but only through
 message tools that take explicit UIDs (max 25, enforced twice), plus folder creation with an explicit name
@@ -60,8 +61,13 @@ a search query or a broad selector as a mutation target. `mail_mark_spam` additi
 `confirm: true` and `acknowledgeFutureFiltering: true` when `dryRun: false`; a missing confirmation is
 rejected before a write-mode lock. A dry-run call structurally cannot mutate anything: it never
 opens a mailbox in write mode at all (proven directly by the test suite, which spies on every
-mutating ImapFlow method and on every lock's `readOnly` flag). If a future version adds any further
-mutating capability, it must follow the same model, and be documented here and in README.md's "V2
+mutating ImapFlow method and on every lock's `readOnly` flag).
+
+V4 (0.4.0) adds `mail_trash` and `mail_restore_from_trash` — both MOVE-based, following exactly this same
+model (explicit UIDs, `dryRun: true` default, confirm/acknowledge gate before any write-mode lock) — and
+`mail_delete_permanently`, which is implemented and fully unit-tested but whose live execution is refused
+unconditionally; see "Permanent delete is feature-gated off in 0.4.0" below. If a future version adds any
+further mutating capability, it must follow the same model, and be documented here and in README.md's "V2
 mutation limitations" before it ships.
 
 ## Stale UIDs are never reused blindly
@@ -76,7 +82,10 @@ exact-match `Message-ID` correlation is used as fallback, nothing else — never
 position. A live 25-message INBOX-to-Social batch showed inconsistent raw per-message UID associations;
 the MCP therefore treats every mapping as untrusted until verified. This project's own code never reuses a
 pre-mutation UID for a follow-up mutation without going through that reconciliation; anything built on top
-of these tools must not either. See README.md ("IMAP UID semantics").
+of these tools must not either. `mail_trash` and `mail_restore_from_trash` (0.4.0) follow the exact same
+reconciliation and write-lock revalidation model — a UID that vanishes between the read-only resolution and
+the write lock is dropped from the batch, never mutated, and the rest proceeds. See README.md ("IMAP UID
+semantics").
 
 ## Custom folders are namespace-confined by construction
 
@@ -116,10 +125,11 @@ the user no longer wants. See README.md ("Spam vs. Archive/Move vs. Block").
 
 ## Untrusted content cannot drive a mutation
 
-No V2 mutation tool reads a message's subject, body, or sender name to decide what to change.
-`mail_apply_label` / `mail_remove_label` read exactly one content-derived field — the `Message-ID`
-header — and only to correlate the same message across two mailboxes, never to decide what action
-to take. The action is always the explicit UIDs and parameters the caller passed in; see
+No mutation tool, in any version, reads a message's subject, body, or sender name to decide what to
+change. `mail_apply_label` / `mail_remove_label` / `mail_trash` / `mail_restore_from_trash` read exactly
+one content-derived field — the `Message-ID` header — and only to correlate the same message across
+mailboxes (or, for `mail_trash`, to check label membership), never to decide what action to take. The
+action is always the explicit UIDs and parameters the caller passed in; see
 `tests/prompt-injection-mutations.test.ts`.
 
 ## V2.5 analysis is read-only and ephemeral
@@ -202,6 +212,71 @@ detected and reported by `mail_unsubscribe_preview` — you always know they exi
 This project does not call, wrap, or rely on that feature in any way; `mail_unsubscribe` implements only the
 one mechanism (RFC 8058 HTTPS one-click) this project's own security model explicitly supports, independent
 of what Proton's client does for the same message.
+
+## Trash lifecycle: labels are measured, never assumed (0.4.0)
+
+Proton labels are separate `Labels/<name>` mailboxes (see README.md "Labels vs. folders"); there is no
+single IMAP fetch that reports "all labels a message has," and this project does not assume Trash either
+preserves or clears them. `src/mutations/label-membership.ts` enumerates label membership by Message-ID
+correlation against every `Labels/<name>` mailbox, read-only (`SEARCH` only, never a write), before and
+after a `mail_trash` move, and the result reports the measured diff (`originalLabels`, `labelsAfterTrash`,
+`labelsRemovedByTrash`) — never a prediction. `mail_trash` never reapplies a label itself.
+`mail_restore_from_trash`'s optional `labelsToRestore` validates each label exists as a real mailbox (never
+auto-created) and only reapplies to a UID whose destination identity was confirmed via the same
+UIDPLUS-verified-then-Message-ID reconciliation every other transition in this project uses — never to a
+UID it isn't sure about. The folder restore and any label reapply are separate IMAP operations; a label
+failure never rolls back the folder move, and the result reports the partial outcome explicitly
+(`labelsRestored` / `labelsFailed` / `requiresRefresh`) rather than hiding it. This project keeps no
+persistent "trash history" of any kind — every label-impact result is recomputed fresh from live IMAP state
+on each call, exactly like every other tool here.
+
+## Why permanent delete is feature-gated off in 0.4.0
+
+`mail_delete_permanently` is, by a wide margin, the most dangerous operation this project has ever
+implemented — genuinely irreversible, unlike everything else here. It is fully implemented and unit-tested
+in 0.4.0 (schema validation, the 5-UID batch cap, the `confirm`/`acknowledgePermanentDeletion`/
+`confirmationPhrase` gate, read-only Trash resolution), but **live execution (`dryRun: false`) is refused
+unconditionally**, even when every confirmation is exactly correct, before any IMAP mutating command is
+issued:
+
+```json
+{ "blocked": true, "blockReason": "livePermanentDeleteDisabled" }
+```
+
+**Threat model this gate exists for**, and how each is addressed structurally, not just by the gate:
+
+- **Prompt injection asking for a delete.** No tool in this project reads subject/body content to decide
+  what to act on (see "Untrusted content cannot drive a mutation" above); `mail_delete_permanently` also
+  requires an exact, out-of-band literal string (`confirmationPhrase: "DELETE PERMANENTLY"`) that cannot be
+  present in a message an attacker sends.
+- **Wildcard/broad UID selection.** The schema accepts only an array of explicit positive integers (max 5);
+  there is no search, range, or "everything" selector anywhere in this tool.
+- **Batch amplification.** Capped at 5 UIDs per call — stricter than every other mutation's 25-UID limit —
+  enforced twice (zod schema, then `assertBatchSize` again in the mutation function).
+- **Stale or reused UIDs, and wrong-folder UIDs.** Resolution happens read-only, immediately before any
+  action, against exactly the account's Trash folder (`sourceFolder` must equal it exactly — no other
+  source is ever accepted); a UID that doesn't currently exist there is reported `missingUids`, never acted
+  on.
+- **Mailbox-wide EXPUNGE.** Structurally forbidden — see the next point — regardless of whether the feature
+  gate above is ever lifted.
+- **Accidental deletion of a message another client already flagged `\Deleted`.** Only possible via a
+  mailbox-wide EXPUNGE, which this project's primitive refuses to ever issue (next point).
+
+**Why mailbox-wide EXPUNGE is forbidden, structurally.** Reading `imapflow`'s own
+`commands/expunge.js` surfaced the exact risk: `ImapFlow`'s own `messageDelete({ uid: true })` silently
+falls back to a plain, unscoped `EXPUNGE` — removing **every** `\Deleted`-flagged message in the mailbox,
+including ones flagged by another client entirely — whenever the server lacks the `UIDPLUS` capability.
+Only with `UIDPLUS` does it issue the UID-scoped `UID EXPUNGE <uids>` (RFC 4315) that touches exactly the
+given UIDs. `src/mutations/permanent-delete.ts` exports `expungeExactUids()` — the **only** function in
+this project that may ever issue a permanent deletion, not called anywhere in 0.4.0 — which checks
+`client.capabilities.get('UIDPLUS')` itself, before issuing any command, and refuses outright (zero
+`messageFlagsAdd`/`messageDelete` calls) if `UIDPLUS` is unavailable, rather than ever reaching that unscoped
+fallback. There is no code path in this project, gated or not, that can issue a mailbox-wide EXPUNGE — see
+`tests/mutations-permanent-delete.test.ts` ("UID-scoped deletion abstraction").
+
+Live permanent deletion ships in a separate, explicitly authorized version after dedicated destructive-action
+validation against a real mailbox — not in this task, and not without the person operating this project
+turning that gate off deliberately in code, reviewed on its own.
 
 ## Reporting
 

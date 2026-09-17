@@ -21,8 +21,11 @@ export interface FakeImapClient {
   messageFlagsRemove: ReturnType<typeof vi.fn>;
   messageMove: ReturnType<typeof vi.fn>;
   messageCopy: ReturnType<typeof vi.fn>;
+  messageDelete: ReturnType<typeof vi.fn>;
   mailboxCreate: ReturnType<typeof vi.fn>;
   mailbox: MailboxObject | false;
+  /** Active IMAP capabilities, mirroring ImapFlow's own `capabilities` map (e.g. `UIDPLUS`). */
+  capabilities: Map<string, boolean | number>;
   lockReleased: boolean;
   /** Every getMailboxLock call, in order — the primary tool for proving what a dry-run did or didn't open. */
   lockCalls: LockCall[];
@@ -61,8 +64,12 @@ export interface FakeImapClientOptions {
   moveResult?: unknown;
   /** messageCopy return value. Default a truthy stub object. */
   copyResult?: unknown;
+  /** messageDelete return value. Default true. */
+  deleteResult?: boolean;
   /** mailboxCreate return value. */
   mailboxCreateResult?: { path: string; created: boolean };
+  /** capabilities map, e.g. `new Map([['UIDPLUS', true]])`. Default empty (no capabilities). */
+  capabilities?: Map<string, boolean | number>;
 }
 
 export function createFakeImapClient(options: FakeImapClientOptions = {}): FakeImapClient {
@@ -115,6 +122,7 @@ export function createFakeImapClient(options: FakeImapClientOptions = {}): FakeI
     lockReleased: false,
     lockCalls: [],
     mailbox,
+    capabilities: options.capabilities ?? new Map<string, boolean | number>(),
     getMailboxLock: vi.fn((path: string, lockOptions?: { readOnly?: boolean }) => {
       currentPath = path;
       fake.lockCalls.push({ path, readOnly: lockOptions?.readOnly });
@@ -143,6 +151,7 @@ export function createFakeImapClient(options: FakeImapClientOptions = {}): FakeI
     messageCopy: vi.fn(
       () => options.copyResult ?? { path: 'source', destination: 'destination', uidMap: new Map() },
     ),
+    messageDelete: vi.fn(() => options.deleteResult ?? true),
     mailboxCreate: vi.fn(() => options.mailboxCreateResult ?? { path: 'New', created: true }),
   };
 

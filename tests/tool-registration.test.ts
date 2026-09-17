@@ -4,6 +4,7 @@ import { registerApplyLabelTool } from '../src/tools/apply-label.js';
 import { registerArchiveTool } from '../src/tools/archive.js';
 import { registerCreateFolderTool } from '../src/tools/create-folder.js';
 import { registerCreateLabelTool } from '../src/tools/create-label.js';
+import { registerDeletePermanentlyTool } from '../src/tools/delete-permanently.js';
 import { registerGetMessageTool } from '../src/tools/get-message.js';
 import { registerListFoldersTool } from '../src/tools/list-folders.js';
 import { registerListMessagesTool } from '../src/tools/list-messages.js';
@@ -12,7 +13,9 @@ import { registerMarkSpamTool } from '../src/tools/mark-spam.js';
 import { registerMarkUnreadTool } from '../src/tools/mark-unread.js';
 import { registerMoveTool } from '../src/tools/move.js';
 import { registerRemoveLabelTool } from '../src/tools/remove-label.js';
+import { registerRestoreFromTrashTool } from '../src/tools/restore-from-trash.js';
 import { registerSearchMailTool } from '../src/tools/search-mail.js';
+import { registerTrashTool } from '../src/tools/trash.js';
 import { registerTriageIntelligenceTools } from '../src/tools/triage-intelligence.js';
 import { registerUnsubscribePreviewTool } from '../src/tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from '../src/tools/unsubscribe.js';
@@ -66,6 +69,26 @@ const intelligenceNames = [
   'mail_triage_snapshot',
 ];
 
+// V4 (0.4.0, "Safe Trash Lifecycle"): mail_trash and mail_delete_permanently
+// are destructiveHint: true (recoverable-but-real-state-change, and
+// irreversible-once-live respectively); mail_restore_from_trash is not.
+// mail_delete_permanently's live execution is additionally, unconditionally
+// feature-gated off in 0.4.0 — see mutations/permanent-delete.ts.
+const trashLifecycleRegistrars = [
+  registerTrashTool,
+  registerRestoreFromTrashTool,
+  registerDeletePermanentlyTool,
+];
+const EXPECTED_TRASH_LIFECYCLE_NAMES = [
+  'mail_delete_permanently',
+  'mail_restore_from_trash',
+  'mail_trash',
+];
+const TRASH_LIFECYCLE_DESTRUCTIVE_HINT_EXPECTED = new Set([
+  'mail_trash',
+  'mail_delete_permanently',
+]);
+
 const EXPECTED_READ_ONLY_NAMES = [
   'mail_get_message',
   'mail_list_folders',
@@ -89,13 +112,19 @@ const EXPECTED_MUTATION_NAMES = [
 
 const DESTRUCTIVE_HINT_EXPECTED = new Set(['mail_mark_spam', 'mail_unsubscribe']);
 
-// Verbs that must NEVER appear in ANY tool name in this project, V1 or V2 —
-// see README.md "V2 NÃO pode conter" / SECURITY.md. "unsubscribe" was
-// removed from this list in 0.3.0: it is now supported, but ONLY through
-// mail_unsubscribe_preview / mail_unsubscribe's narrow, RFC 8058-only,
-// consent-gated path — see SECURITY.md ("External HTTP side effect").
+// Verbs that must NEVER appear in ANY tool name in this project — see
+// README.md "V2 mutation limitations" / SECURITY.md. "unsubscribe" was
+// removed from this list in 0.3.0 (mail_unsubscribe_preview /
+// mail_unsubscribe's narrow, RFC 8058-only, consent-gated path);
+// "delete"/"trash"/"permanent" were removed in 0.4.0 for the same reason:
+// mail_trash, mail_restore_from_trash, and mail_delete_permanently are now
+// supported, but ONLY through their own narrow, heavily-gated paths — see
+// the "V4 — Safe Trash Lifecycle" tests below, which pin down the EXACT set
+// of delete/trash-named tools allowed to exist. "expunge" stays banned
+// outright: no tool in this project is ever named after the raw IMAP
+// command, ideally or in a gated form.
 const BANNED_NAME_PATTERN =
-  /^mail_(delete|trash|expunge|smtp|send(?:_|$)|reply|forward|permanent|block[_-]?list|allow[_-]?list|draft.?send)/i;
+  /^mail_(expunge|smtp|send(?:_|$)|reply|forward|block[_-]?list|allow[_-]?list|draft.?send)/i;
 
 describe('V1 read-only tool registration', () => {
   it('registers exactly the five documented read-only tool names', () => {
@@ -150,19 +179,44 @@ describe('V2 mutation tool registration', () => {
   });
 });
 
+describe('V4 — Safe Trash Lifecycle tool registration', () => {
+  it('registers exactly the three documented trash-lifecycle tool names', () => {
+    const names = trashLifecycleRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    expect(names.sort()).toEqual(EXPECTED_TRASH_LIFECYCLE_NAMES);
+  });
+
+  it('marks every V4 tool as NOT read-only', () => {
+    for (const register of trashLifecycleRegistrars) {
+      const [registration] = captureRegistrations(register);
+      expect(registration?.config.annotations?.readOnlyHint).toBe(false);
+    }
+  });
+
+  it('marks mail_trash and mail_delete_permanently destructiveHint: true, mail_restore_from_trash false', () => {
+    for (const register of trashLifecycleRegistrars) {
+      const [registration] = captureRegistrations(register);
+      const expected = TRASH_LIFECYCLE_DESTRUCTIVE_HINT_EXPECTED.has(registration?.name ?? '');
+      expect(registration?.config.annotations?.destructiveHint).toBe(expected);
+    }
+  });
+});
+
 describe('the full tool surface', () => {
   const allRegistrars = [
     ...readOnlyRegistrars,
     ...mutationRegistrars,
     registerTriageIntelligenceTools,
+    ...trashLifecycleRegistrars,
   ];
 
-  it('is exactly 20 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5)', () => {
+  it('is exactly 23 tools, matching V1 (5) + V2/V2.6 (10) + V2.5 (5) + V4 (3)', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    expect(names).toHaveLength(20);
-    expect(new Set(names).size).toBe(20); // no accidental duplicate names
+    expect(names).toHaveLength(23);
+    expect(new Set(names).size).toBe(23); // no accidental duplicate names
   });
 
   it('contains no tool whose name suggests a banned/destructive operation', () => {
@@ -186,13 +240,19 @@ describe('the full tool surface', () => {
     }
   });
 
-  it('has no delete, trash, or expunge tool registered anywhere', () => {
+  it('has no expunge tool registered anywhere', () => {
     const names = allRegistrars.flatMap((register) =>
       captureRegistrations(register).map((call) => call.name),
     );
-    for (const forbidden of ['delete', 'trash', 'expunge']) {
-      expect(names.some((name) => name.toLowerCase().includes(forbidden))).toBe(false);
-    }
+    expect(names.some((name) => name.toLowerCase().includes('expunge'))).toBe(false);
+  });
+
+  it('the only delete/trash-named tools are the three documented V4 lifecycle tools', () => {
+    const names = allRegistrars.flatMap((register) =>
+      captureRegistrations(register).map((call) => call.name),
+    );
+    const deleteOrTrashNamed = names.filter((name) => /delete|trash/i.test(name));
+    expect(deleteOrTrashNamed.sort()).toEqual(EXPECTED_TRASH_LIFECYCLE_NAMES);
   });
 });
 

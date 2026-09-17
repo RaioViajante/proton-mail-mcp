@@ -2,9 +2,10 @@
 
 A local MCP server that lets Claude Code work with your Proton Mail account through
 [Proton Mail Bridge](https://proton.me/mail/bridge)'s local IMAP interface: read mail (V1), triage it as of
-V2 — mark read/unread, archive, move, mark as spam, apply/remove labels, and create folders — and, as of
+V2 — mark read/unread, archive, move, mark as spam, apply/remove labels, and create folders — as of
 V3 (0.3.0), unsubscribe from a mailing list through exactly one narrow, standards-based, consent-gated
-mechanism.
+mechanism, and as of V4 (0.4.0, "Safe Trash Lifecycle"), move mail to Trash, restore it, and — dry-run only,
+live execution deliberately disabled for now — preview a permanent deletion.
 
 **V1** (read-only) is unconditionally safe: there is no code path in those tools that can change anything.
 **V2** (mutation) tools can change your mailbox within a narrow model: message mutations take explicit
@@ -15,7 +16,10 @@ model"](#mutation-model) and ["V2 mutation limitations"](#v2-mutation-limitation
 "Controlled Unsubscribe") adds a read-only `mail_unsubscribe_preview` and a single-message, consent-gated
 `mail_unsubscribe` that executes ONLY the RFC 8058 HTTPS one-click mechanism — never a body link, never
 `mailto:`, never browser automation. See ["V3 — Controlled Unsubscribe"](#v3--controlled-unsubscribe-030)
-below.
+below. **V4** (0.4.0, "Safe Trash Lifecycle") adds `mail_trash`, `mail_restore_from_trash`, and
+`mail_delete_permanently` — the last is implemented and fully unit-tested, but live execution is
+unconditionally disabled by a hard feature gate until a separate, dedicated destructive-action validation.
+See ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040) below.
 
 ## Security model
 
@@ -35,8 +39,11 @@ below.
   folder creation takes an explicit name and optional parent. None acts on the result of a search or on
   "everything in this folder." See ["Mutation
   model"](#mutation-model).
-- **No delete or send tools exist in this codebase.** There is no delete, trash, expunge, permanent-delete, or
-  SMTP/send/reply/forward tool — not "disabled," genuinely not implemented, in V1 or V2.
+- **No send/SMTP tool exists in this codebase**, and no tool ever issues a mailbox-wide EXPUNGE. There is no
+  SMTP/send/reply/forward tool — not "disabled," genuinely not implemented, in any version. V4 (0.4.0) adds
+  `mail_trash` and `mail_restore_from_trash` (both fully live), and `mail_delete_permanently` — implemented
+  and fully unit-tested, but its live execution is unconditionally refused by a hard feature gate; see ["V4 —
+  Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040).
 - **Email content is always labeled untrusted, and can never drive a mutation.** See ["Threat
   model"](#threat-model-prompt-injection-via-email).
 
@@ -47,7 +54,7 @@ See [SECURITY.md](SECURITY.md) for the condensed version of these rules.
 ```
 src/
   index.ts              # process entry point; starts the server over stdio
-  server.ts              # builds the McpServer and registers all 20 tools
+  server.ts              # builds the McpServer and registers all 23 tools
   bridge/
     client.ts            # opens/closes a Bridge IMAP connection
     config.ts            # non-secret config file + macOS Keychain password lookup
@@ -66,6 +73,10 @@ src/
     labels.ts                      # apply/remove label (see "Labels vs. folders")
     folders.ts                      # create folder and shared name validation
     create-label.ts                 # create flat label
+    label-membership.ts             # V4: which Labels/<name> mailboxes correlate to a message, before/after Trash
+    trash.ts                         # V4: mail_trash core (move + label-impact measurement)
+    restore.ts                       # V4: mail_restore_from_trash core (move + optional label reapply)
+    permanent-delete.ts              # V4: mail_delete_permanently core + the gated UID-scoped expunge primitive
   unsubscribe/              # V3 (0.3.0) — see "V3 — Controlled Unsubscribe"
     headers.ts               # single-message List-Unsubscribe/-Post/Authentication-Results fetch
     decision.ts               # the ONLY place eligibility/authenticationStatus is decided; sanitizes output
@@ -79,6 +90,7 @@ src/
     mark-read.ts, mark-unread.ts, archive.ts, move.ts,                      # V2
     mark-spam.ts, apply-label.ts, remove-label.ts, create-folder.ts, create-label.ts,
     unsubscribe.ts                                                         # V3 (mutation)
+    trash.ts, restore-from-trash.ts, delete-permanently.ts                  # V4 (0.4.0)
   security/
     untrusted-content.ts  # labels + bounds any text pulled from an email
 
@@ -224,8 +236,9 @@ pnpm start       # run the built server (dist/index.js) over stdio
 
 Tests never connect to a real mailbox: `tests/fakes/imap-client.ts` provides a fake of the slice of
 ImapFlow's API this project uses, including spies on every mutating method (`messageFlagsAdd`,
-`messageFlagsRemove`, `messageMove`, `messageCopy`, `mailboxCreate`), so a dry-run test can assert none of
-them was ever called.
+`messageFlagsRemove`, `messageMove`, `messageCopy`, `messageDelete`, `mailboxCreate`) and a configurable
+`capabilities` map (e.g. `UIDPLUS`), so a dry-run test can assert none of them was ever called, and a
+permanent-delete test can assert the UID-scoped primitive refuses without `UIDPLUS`.
 
 ## MCP tools
 
@@ -281,6 +294,10 @@ change what a tool can actually do; the real protections are unchanged.
 | `mail_remove_label`  | `label`                                                        | Removes an existing Proton label. Same caveats as above.                                                                                                                                                                                                  |
 | `mail_create_folder` | `name`, `parent` (optional)                                    | Creates a custom folder, always resolved under `Folders/` (see ["Proton Bridge namespace"](#proton-bridge-namespace-folders-and-labels)). Refuses reserved names and protected parents. No rename/delete yet.                                             |
 | `mail_create_label`  | `name`                                                         | Creates a flat custom label under `Labels/`; does not apply it to any message. Rejects raw paths and names already used by a folder or label.                                                                                                             |
+
+V4 (0.4.0) adds three more mutation tools, described in full in ["V4 — Safe Trash
+Lifecycle"](#v4--safe-trash-lifecycle-040): `mail_trash`, `mail_restore_from_trash`, and
+`mail_delete_permanently` (implemented and dry-run capable — live execution is feature-gated off).
 
 ## Mutation model
 
@@ -379,8 +396,8 @@ label-removal round trip.
 ### The `transitions` field
 
 Every mutation that can relocate a message (`mail_move`, `mail_archive`, `mail_mark_spam`,
-`mail_remove_label`) — and `mail_apply_label`, for a related but different reason — reports what it could
-determine about post-mutation identity, per changed UID:
+`mail_remove_label`, `mail_trash`, `mail_restore_from_trash`) — and `mail_apply_label`, for a related but
+different reason — reports what it could determine about post-mutation identity, per changed UID:
 
 ```json
 {
@@ -573,10 +590,11 @@ without including the sender address. Live results retain the normal UID `transi
 
 ## V2 mutation limitations
 
-None of the following exist in this codebase (not "disabled" — not implemented), in V1, V2, or V3:
+None of the following exist in this codebase, in any version:
 
-- delete message, empty trash, permanent delete, or any use of IMAP EXPUNGE as a user-facing operation
-- SMTP, send, reply, forward, or sending a draft
+- SMTP, send, reply, forward, or sending a draft — not "disabled," genuinely not implemented
+- a mailbox-wide (unscoped) IMAP EXPUNGE, reachable from any code path, gated or not — see ["Why
+  mailbox-wide EXPUNGE is forbidden"](#why-mailbox-wide-expunge-is-forbidden)
 - Proton Block List, Allow List, or Spam List management
 - unsubscribe via a body link, `mailto:`, or browser automation — V3 (0.3.0) added exactly one narrow,
   consent-gated path (RFC 8058 HTTPS one-click); see ["V3 — Controlled
@@ -584,9 +602,15 @@ None of the following exist in this codebase (not "disabled" — not implemented
 - opening URLs found inside emails, for any purpose other than the single validated one-click POST V3 makes
 - browser automation of any kind for Proton Mail
 - rename or delete folder (only `mail_create_folder` exists so far)
+- **live permanent message deletion** — V4 (0.4.0) added `mail_delete_permanently`, fully implemented and
+  unit-tested, but its live execution (`dryRun: false`) is unconditionally refused by a hard feature gate;
+  see ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040)
 - any tool that accepts a search query, wildcard, or "everything" selector as a mutation target — message
   mutations take explicit UIDs, while folder creation takes an explicit name; `mail_unsubscribe` takes
   exactly one explicit UID, never a batch
+
+Since V4 (0.4.0): moving mail to Trash and restoring it from Trash are both fully live, explicit-UID-only
+operations — see the next section.
 
 ## V2.5 — Triage intelligence and rule proposals (read-only)
 
@@ -760,6 +784,145 @@ project does not call, wrap, or depend on that feature — `mail_unsubscribe` im
 mechanism this project's own security model explicitly supports (RFC 8058 HTTPS one-click), independently of
 whatever Proton's client does or does not do for the same message.
 
+## V4 — Safe Trash Lifecycle (0.4.0)
+
+Three new mutation tools, all explicit-UID-only (never a search or "everything"), all defaulting to
+`dryRun: true`.
+
+### Feature matrix
+
+| Capability                                     | Status                                                                          |
+| ---------------------------------------------- | ------------------------------------------------------------------------------- |
+| Move to Trash (`mail_trash`)                   | Supported (live)                                                                |
+| Restore from Trash (`mail_restore_from_trash`) | Supported (live), including optional label reapply                              |
+| Permanent delete — dry-run                     | Supported                                                                       |
+| Permanent delete — live                        | **Disabled**, unconditionally, pending a separate destructive-action validation |
+
+### Archive vs. Trash — not the same operation
+
+`mail_archive` and `mail_move` relocate a message between ordinary folders. `mail_trash` relocates it into
+Proton's **Trash**, a different default folder with different consequences this project does not assume
+away:
+
+- Trash is where a permanently-deletable message lives — `mail_delete_permanently` only ever accepts
+  `sourceFolder` exactly equal to the account's resolved Trash folder.
+- Proton may remove some or all of a message's labels as a side effect of the message entering Trash. This
+  project never assumes either way — it **measures** label membership before and after the move and reports
+  the diff (see "Labels are measured, never assumed" below), the same conservative approach this project
+  already takes for UID transitions (see ["IMAP UID semantics"](#imap-uid-semantics)).
+
+### `mail_trash`
+
+Input: `sourceFolder`, `uids` (1–25, explicit, no wildcard), `dryRun` (default `true`). Live execution
+requires **both** `confirm: true` and `acknowledgeTrashMove: true` — the same dual-confirmation shape
+`mail_mark_spam` and `mail_unsubscribe` already use. Refuses when `sourceFolder` is already Trash. Before any
+mutation, captures each matched message's current label membership (`originalLabels`) via
+Message-ID correlation against every `Labels/<name>` mailbox — see `src/mutations/label-membership.ts`.
+Message-ID itself is never returned or persisted; only label **names**, which are not secrets. After a live
+move, membership is re-measured and the result reports, per UID:
+
+```json
+{
+  "labelImpacts": [
+    {
+      "uid": 42,
+      "originalLabels": ["Work"],
+      "labelsAfterTrash": [],
+      "labelsRemovedByTrash": ["Work"]
+    }
+  ]
+}
+```
+
+`mail_trash` never reapplies a removed label itself — no write to any `Labels/<name>` mailbox happens as
+part of this call. Follows the same write-lock revalidation and UIDPLUS-verified-then-Message-ID transition
+reconciliation every relocating mutation in this project already follows (see ["IMAP UID
+semantics"](#imap-uid-semantics)); a stale UID is dropped from the batch, never mutated, and the rest of the
+batch still proceeds.
+
+### `mail_restore_from_trash`
+
+Input: `uids` in Trash (1–25, explicit), `destinationFolder` (explicit), optional `labelsToRestore`, `dryRun`
+(default `true`). Live execution requires `confirm: true` and `acknowledgeRestoreFromTrash: true`.
+`destinationFolder` reuses `mail_move`'s exact destination policy
+(`resolveMoveDestination`/`assertMoveDestinationAllowed` in `src/mutations/policy.ts`): Trash, Spam, Sent,
+Drafts, All Mail, a bare namespace container, or a `Labels/...` reference are all rejected. Spam is rejected
+outright rather than given its own ad-hoc acknowledgement parameter — `mail_mark_spam` already exists as the
+one, specifically-gated way to put a message in Spam.
+
+If `labelsToRestore` is given, each label is validated to exist as a real `Labels/<name>` mailbox and is
+**never created automatically**. Label reapply is a separate IMAP operation from the folder move and is
+**never presented as atomic** with it: if the move succeeds but a label fails to reapply (doesn't exist,
+IMAP rejects it, or the destination identity couldn't be confirmed without guessing), the move is **never
+rolled back** — the result reports the partial outcome explicitly:
+
+```json
+{
+  "moveRestored": [42],
+  "labelsRequested": ["Work", "Ghost"],
+  "labelsRestored": [{ "uid": 42, "label": "Work" }],
+  "labelsFailed": [
+    { "uid": 42, "label": "Ghost", "reason": "Label does not exist; not created automatically." }
+  ],
+  "requiresRefresh": false
+}
+```
+
+A label is only ever reapplied to a UID whose destination identity was confirmed via the same UIDPLUS
+mapping / Message-ID correlation every other transition in this project uses — never to a `resultingUid`
+this project isn't sure about; when it can't be confirmed, that label attempt is reported as failed and
+`requiresRefresh: true` is set instead of guessing.
+
+### `mail_delete_permanently` (implemented; live execution disabled in 0.4.0)
+
+The most dangerous operation in this project. Schema: `sourceFolder` must be exactly the account's Trash
+folder; `uids` explicit, max **5** (stricter than the general 25-UID mutation limit — see
+`MAX_PERMANENT_DELETE_UIDS` in `src/mutations/batch.ts`); `dryRun` defaults to `true`. Live execution would
+additionally require `confirm: true`, `acknowledgePermanentDeletion: true`, **and** `confirmationPhrase`
+exactly `"DELETE PERMANENTLY"` — but even with every one of those correct, **live execution is
+unconditionally refused** by a hard feature gate before any IMAP mutating command is issued:
+
+```json
+{
+  "operation": "mail_delete_permanently",
+  "dryRun": false,
+  "blocked": true,
+  "blockReason": "livePermanentDeleteDisabled"
+}
+```
+
+This is a deliberate, documented limitation, not a bug — see ["Why permanent delete is feature-gated off in
+0.4.0"](#why-permanent-delete-is-feature-gated-off-in-040) in SECURITY.md. A dry-run only resolves which of
+the requested UIDs currently exist in Trash; it issues zero IMAP mutating commands.
+
+### Why mailbox-wide EXPUNGE is forbidden
+
+Reading `imapflow`'s own implementation (`node_modules/imapflow/.../commands/expunge.js`) surfaced the exact
+risk this project designs around: `ImapFlow`'s `messageDelete({ uid: true })` silently falls back to a plain,
+**mailbox-wide** `EXPUNGE` — removing **every** message flagged `\Deleted` in the mailbox, including ones
+flagged by another client entirely — whenever the server doesn't support the `UIDPLUS` extension. Only with
+`UIDPLUS` does it issue the scoped `UID EXPUNGE <uids>` (RFC 4315) that touches exactly the given UIDs.
+
+`src/mutations/permanent-delete.ts` exports `expungeExactUids()`, the **only** function in this project that
+may ever issue a permanent deletion — not called anywhere in 0.4.0 (the feature gate refuses before reaching
+it), implemented and unit-tested now so a future version's gate removal has a structurally-safe primitive
+ready. It checks `client.capabilities.get('UIDPLUS')` itself, **before** issuing any command, and refuses
+outright — zero `messageFlagsAdd`/`messageDelete` calls — if `UIDPLUS` is unavailable, rather than ever
+reaching ImapFlow's own unscoped fallback. There is no code path in this project, gated or not, that can
+issue a mailbox-wide EXPUNGE.
+
+### Labels are measured, never assumed
+
+Neither `mail_trash` nor this project generally assumes labels survive (or don't survive) any folder move.
+Proton labels are separate `Labels/<name>` mailboxes (see ["Labels vs.
+folders"](#labels-vs-folders-live-confirmed-behavior)); there is no single IMAP fetch that reports "all
+labels this message has." `src/mutations/label-membership.ts` is the one place that enumerates label
+membership, by checking Message-ID correlation against every `Labels/<name>` mailbox — used to compute
+`originalLabels`/`labelsAfterTrash` for `mail_trash` and to validate `labelsToRestore` for
+`mail_restore_from_trash`. This project keeps **no persistent "trash history" database** of any kind — it
+stays stateless, exactly like every other tool here; every label-impact result is recomputed fresh from
+live IMAP state on each call.
+
 ## Threat model (prompt injection via email)
 
 Email is attacker-controlled input. Anyone who can send you mail can put arbitrary text — including text
@@ -782,7 +945,12 @@ This server's defenses:
    `confirm: true`, and `acknowledgeFutureFiltering: true` to execute. `mail_unsubscribe` requires
    `dryRun: false`, `confirm: true`, and `acknowledgeExternalUnsubscribe: true`, AND the message's own
    authentication must independently resolve to `verified` — see ["V3 — Controlled
-   Unsubscribe"](#v3--controlled-unsubscribe-030).
+   Unsubscribe"](#v3--controlled-unsubscribe-030). `mail_trash` requires `dryRun: false`, `confirm: true`,
+   and `acknowledgeTrashMove: true`; `mail_restore_from_trash` requires `dryRun: false`, `confirm: true`, and
+   `acknowledgeRestoreFromTrash: true`; `mail_delete_permanently` requires all of `dryRun: false`,
+   `confirm: true`, `acknowledgePermanentDeletion: true`, AND `confirmationPhrase` exactly
+   `"DELETE PERMANENTLY"` — and even then, live execution is unconditionally refused by a feature gate. See
+   ["V4 — Safe Trash Lifecycle"](#v4--safe-trash-lifecycle-040).
 4. **No raw HTML, bounded size.** HTML-only messages are converted to inert plain text before being returned,
    and bodies are capped at 20,000 characters.
 5. **`List-Unsubscribe` is treated as hostile input, structurally.** `mail_unsubscribe` never reads the
@@ -810,7 +978,7 @@ claude mcp add --scope user proton-mail node /path/to/proton-mail-mcp/dist/index
   restrictive `--scope local` (private to you, scoped to the current project directory) works too.
 - No `-e` / environment variables and no header/token flags — there is nothing secret to pass.
 
-Verify it's registered, connects, and exposes all 20 tools:
+Verify it's registered, connects, and exposes all 23 tools:
 
 ```
 claude mcp list

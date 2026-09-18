@@ -60,14 +60,12 @@ and reports a `mailto:`-only mechanism in `mail_unsubscribe_preview` but never e
 Bridge instance, never a general-purpose SMTP client:
 
 - The configured SMTP host must resolve to loopback — a loopback IP literal (`127.0.0.0/8`, `::1`)
-  or `localhost`/`*.localhost`, and even `localhost` is re-resolved and every returned address
-  re-checked as loopback before a connection is ever attempted (`src/smtp/host-safety.ts`,
-  `resolveAndValidateLoopbackHost` — the same DNS-rebinding defense `unsubscribe/url-safety.ts` uses
-  for the opposite direction). `smtp.gmail.com`, `smtp.office365.com`, any other public hostname, any
-  LAN IP, and any non-loopback IP literal are all rejected — structurally, not just discouraged — at
-  config-load time (`SmtpConfigSchema`) **and again** at transport-creation time
-  (`createSmtpTransport`), the same "enforced twice by design" pattern `mutations/batch.ts` uses for
-  UID limits.
+  or `localhost`/`*.localhost`. Before transport creation, every DNS answer for a hostname must be
+  loopback. Nodemailer receives one validated IP, so it cannot resolve the hostname again after
+  validation; the original hostname remains the TLS verification name. IP literals omit SNI.
+  `smtp.gmail.com`, `smtp.office365.com`, any other public hostname, any LAN IP, and any
+  non-loopback IP literal are rejected at config-load time (`SmtpConfigSchema`) and again at
+  transport-creation time (`createSmtpTransport`).
 - No plaintext SMTP, ever. `SmtpSecurity` (`starttls` | `tls`) has no plaintext member at all — a
   config that omits security, or names an unrecognized mode, fails validation rather than falling
   back to anything insecure. STARTTLS mode sets nodemailer's `requireTLS`, so a Bridge that

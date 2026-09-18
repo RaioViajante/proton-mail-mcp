@@ -1,6 +1,17 @@
 import { isIP } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns/promises';
 
+export interface ResolvedLoopbackHost {
+  address: string;
+  /** Set only for DNS names, so TLS verifies the configured name. */
+  servername?: string;
+}
+
+export type SmtpLookup = (
+  hostname: string,
+  options: { all: true; verbatim: true },
+) => Promise<{ address: string; family: number }[]>;
+
 /**
  * Host allowlist for the SMTP transport (0.5.0). This project is a client
  * for exactly one thing: a locally running Proton Mail Bridge instance. It
@@ -82,26 +93,34 @@ export function checkSmtpHostStructurallySafe(rawHost: string): SmtpHostSafetyCh
  * {@link checkSmtpHostStructurallySafe} already rejected every other
  * hostname before this is ever called.
  */
-export async function resolveAndValidateLoopbackHost(rawHost: string): Promise<string> {
+export async function resolveAndValidateLoopbackHost(
+  rawHost: string,
+  lookup: SmtpLookup = dnsLookup,
+): Promise<ResolvedLoopbackHost> {
   const host = rawHost.trim().toLowerCase();
+  if (!checkSmtpHostStructurallySafe(host).safe) {
+    throw new Error('SMTP host is not permitted.');
+  }
   if (isIP(host) !== 0) {
     if (!isLoopbackIp(host)) {
-      throw new Error(`SMTP host "${rawHost}" is not a loopback address.`);
+      throw new Error('SMTP host is not a loopback address.');
     }
-    return host;
+    return { address: host };
   }
 
-  const results = await dnsLookup(host, { all: true, verbatim: true });
+  let results: { address: string; family: number }[];
+  try {
+    results = await lookup(host, { all: true, verbatim: true });
+  } catch {
+    throw new Error('SMTP host resolution failed.');
+  }
   if (results.length === 0) {
-    throw new Error(`DNS resolution for "${host}" returned no addresses.`);
+    throw new Error('SMTP host resolution returned no addresses.');
   }
   for (const result of results) {
-    if (!isLoopbackIp(result.address)) {
-      throw new Error(
-        `DNS resolution for "${host}" returned a non-loopback address (${result.address}); ` +
-          'refusing to connect (possible DNS rebinding or misconfigured hosts file).',
-      );
+    if (!isLoopbackIp(result.address) || isIP(result.address) !== result.family) {
+      throw new Error('SMTP host resolution returned an unsafe address.');
     }
   }
-  return host;
+  return { address: results[0]!.address, servername: host };
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   checkSmtpHostStructurallySafe,
   isLoopbackIp,
@@ -77,14 +77,54 @@ describe('checkSmtpHostStructurallySafe', () => {
 
 describe('resolveAndValidateLoopbackHost', () => {
   it('resolves a loopback IP literal without DNS (short-circuits)', async () => {
-    await expect(resolveAndValidateLoopbackHost('127.0.0.1')).resolves.toBe('127.0.0.1');
+    await expect(resolveAndValidateLoopbackHost('127.0.0.1')).resolves.toEqual({
+      address: '127.0.0.1',
+    });
+    await expect(resolveAndValidateLoopbackHost('::1')).resolves.toEqual({ address: '::1' });
   });
 
   it('rejects a non-loopback IP literal without attempting DNS', async () => {
-    await expect(resolveAndValidateLoopbackHost('8.8.8.8')).rejects.toThrow(/not a loopback/i);
+    await expect(resolveAndValidateLoopbackHost('8.8.8.8')).rejects.toThrow(/not permitted/i);
   });
 
-  it('resolves "localhost" and confirms every returned address is loopback', async () => {
-    await expect(resolveAndValidateLoopbackHost('localhost')).resolves.toBe('localhost');
+  it('pins a hostname to a validated loopback address', async () => {
+    const lookup = vi.fn().mockResolvedValue([
+      { address: '127.0.0.1', family: 4 },
+      { address: '::1', family: 6 },
+    ]);
+    await expect(resolveAndValidateLoopbackHost('localhost', lookup)).resolves.toEqual({
+      address: '127.0.0.1',
+      servername: 'localhost',
+    });
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [{ address: '8.8.8.8', family: 4 }],
+    [{ address: '192.168.1.5', family: 4 }],
+    [{ address: '169.254.1.1', family: 4 }],
+    [{ address: '0.0.0.0', family: 4 }],
+    [{ address: '224.0.0.1', family: 4 }],
+    [{ address: '2001:4860:4860::8888', family: 6 }],
+    [
+      { address: '127.0.0.1', family: 4 },
+      { address: '8.8.8.8', family: 4 },
+    ],
+  ])('rejects an unsafe or mixed DNS answer', async (...results) => {
+    await expect(
+      resolveAndValidateLoopbackHost('localhost', vi.fn().mockResolvedValue(results)),
+    ).rejects.toThrow(/unsafe address/i);
+  });
+
+  it('fails closed on DNS error or empty response', async () => {
+    await expect(
+      resolveAndValidateLoopbackHost(
+        'localhost',
+        vi.fn().mockRejectedValue(new Error('DNS detail')),
+      ),
+    ).rejects.toThrow('SMTP host resolution failed.');
+    await expect(
+      resolveAndValidateLoopbackHost('localhost', vi.fn().mockResolvedValue([])),
+    ).rejects.toThrow('SMTP host resolution returned no addresses.');
   });
 });

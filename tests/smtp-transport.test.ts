@@ -32,44 +32,69 @@ describe('createSmtpTransport', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('fails closed when the TLS certificate file is missing (never connects without it)', () => {
-    expect(() =>
+  it('fails closed when the TLS certificate file is missing (never connects without it)', async () => {
+    await expect(
       createSmtpTransport({ ...config, tlsCertPath: join(dir, 'does-not-exist.pem') }, 'pw'),
-    ).toThrow(/Could not read the Proton Mail Bridge TLS certificate/);
+    ).rejects.toThrow(/Could not read the Proton Mail Bridge TLS certificate/);
   });
 
-  it('fails closed for a non-loopback host even if one somehow reaches this function directly', () => {
-    expect(() => createSmtpTransport({ ...config, host: 'smtp.gmail.com' }, 'pw')).toThrow(
+  it('fails closed for a non-loopback host even if one somehow reaches this function directly', async () => {
+    await expect(createSmtpTransport({ ...config, host: 'smtp.gmail.com' }, 'pw')).rejects.toThrow(
       /not permitted/i,
     );
   });
 
-  it('never disables certificate validation (rejectUnauthorized stays true)', () => {
-    const transport = createSmtpTransport(config, 'pw');
+  it('never disables certificate validation (rejectUnauthorized stays true)', async () => {
+    const transport = await createSmtpTransport(config, 'pw');
     const options = transport.options as unknown as { tls?: { rejectUnauthorized?: boolean } };
     expect(options.tls?.rejectUnauthorized).toBe(true);
     transport.close();
   });
 
-  it('requireTLS is set for STARTTLS mode (never silently falls back to plaintext)', () => {
-    const transport = createSmtpTransport(config, 'pw');
+  it('requireTLS is set for STARTTLS mode (never silently falls back to plaintext)', async () => {
+    const transport = await createSmtpTransport(config, 'pw');
     const options = transport.options as unknown as { requireTLS?: boolean; secure?: boolean };
     expect(options.requireTLS).toBe(true);
     expect(options.secure).toBe(false);
     transport.close();
   });
 
-  it('secure is true for direct TLS mode', () => {
-    const transport = createSmtpTransport({ ...config, security: 'tls' }, 'pw');
+  it('secure is true for direct TLS mode', async () => {
+    const transport = await createSmtpTransport({ ...config, security: 'tls' }, 'pw');
     const options = transport.options as unknown as { secure?: boolean };
     expect(options.secure).toBe(true);
     transport.close();
   });
 
-  it('is never pooled — one-shot connection per send', () => {
-    const transport = createSmtpTransport(config, 'pw');
+  it('is never pooled — one-shot connection per send', async () => {
+    const transport = await createSmtpTransport(config, 'pw');
     const options = transport.options as unknown as { pool?: boolean };
     expect(options.pool).toBe(false);
+    transport.close();
+  });
+
+  it('uses the validated IP without second DNS resolution and preserves TLS hostname verification', async () => {
+    const lookup = vi.fn().mockResolvedValue([{ address: '127.0.0.2', family: 4 }]);
+    const transport = await createSmtpTransport({ ...config, host: 'localhost' }, 'pw', lookup);
+    const options = transport.options as unknown as {
+      host?: string;
+      tls?: { servername?: string; rejectUnauthorized?: boolean };
+    };
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(options.host).toBe('127.0.0.2');
+    expect(options.tls?.servername).toBe('localhost');
+    expect(options.tls?.rejectUnauthorized).toBe(true);
+    transport.close();
+  });
+
+  it('omits TLS servername for IP literals, including IPv6 loopback', async () => {
+    const transport = await createSmtpTransport({ ...config, host: '::1' }, 'pw');
+    const options = transport.options as unknown as {
+      host?: string;
+      tls?: { servername?: string };
+    };
+    expect(options.host).toBe('::1');
+    expect(options.tls?.servername).toBeUndefined();
     transport.close();
   });
 });
@@ -211,6 +236,24 @@ describe('submitSmtp — controlled fakes, never a real socket', () => {
     const sendFn = vi.fn();
     const result = await submitSmtp({ ...config, host: 'smtp.gmail.com' }, 'pw', message, sendFn);
     expect(result.outcome).toBe('failed');
+    expect(sendFn).not.toHaveBeenCalled();
+  });
+
+  it('live submission validates DNS and never creates a transport for an unsafe answer', async () => {
+    const sendFn = vi.fn();
+    const lookup = vi.fn().mockResolvedValue([
+      { address: '127.0.0.1', family: 4 },
+      { address: '8.8.8.8', family: 4 },
+    ]);
+    const result = await submitSmtp(
+      { ...config, host: 'localhost' },
+      'pw',
+      message,
+      sendFn,
+      lookup,
+    );
+    expect(result.outcome).toBe('failed');
+    expect(result.reasons).toEqual(['Could not create a safe SMTP transport.']);
     expect(sendFn).not.toHaveBeenCalled();
   });
 

@@ -1,8 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { isIP } from 'node:net';
 import { createTransport, type Transporter } from 'nodemailer';
 import type { ResolvedSmtpConfig } from './config.js';
-import { checkSmtpHostStructurallySafe } from './host-safety.js';
+import { resolveAndValidateLoopbackHost, type SmtpLookup } from './host-safety.js';
 import {
   classifySmtpError,
   classifySmtpSuccess,
@@ -50,29 +49,25 @@ function readTlsCertificate(tlsCertPath: string): string {
  * to exploit, but this keeps a future nodemailer message option from ever
  * being able to read a local file or fetch a URL by surprise.
  */
-export function createSmtpTransport(config: ResolvedSmtpConfig, password: string): Transporter {
-  // Defense in depth (enforced twice by design, mirroring
-  // mutations/batch.ts's MAX_MUTATION_UIDS comment): SmtpConfigSchema
-  // already rejects a non-loopback host at config-load time, but this
-  // function never trusts that as the only gate — an external SMTP host
-  // must be structurally impossible to reach from here even if some future
-  // caller ever constructs a ResolvedSmtpConfig by hand.
-  const hostCheck = checkSmtpHostStructurallySafe(config.host);
-  if (!hostCheck.safe) {
-    throw new Error(hostCheck.reason ?? `SMTP host "${config.host}" is not permitted.`);
-  }
+export async function createSmtpTransport(
+  config: ResolvedSmtpConfig,
+  password: string,
+  lookup?: SmtpLookup,
+): Promise<Transporter> {
+  // Nodemailer receives only the validated IP. It cannot resolve the
+  // configured hostname a second time after validation.
+  const target = await resolveAndValidateLoopbackHost(config.host, lookup);
   const ca = readTlsCertificate(config.tlsCertPath);
   return createTransport({
-    host: config.host,
+    host: target.address,
     port: config.port,
     secure: config.security === 'tls',
     requireTLS: config.security === 'starttls',
     tls: {
       ca: [ca],
       rejectUnauthorized: true,
-      // SNI is only valid for DNS hostnames, not IP literals (RFC 6066) —
-      // mirrors bridge/client.ts's identical conditional for IMAP.
-      ...(isIP(config.host) === 0 ? { servername: config.host } : {}),
+      // Retain hostname verification for DNS names; omit SNI for IP literals.
+      ...(target.servername ? { servername: target.servername } : {}),
     },
     auth: { user: config.username, pass: password },
     connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
@@ -148,11 +143,12 @@ export async function submitSmtp(
   password: string,
   message: SmtpMessage,
   sendFn: SmtpSendFn = defaultSmtpSend,
+  lookup?: SmtpLookup,
 ): Promise<SmtpAttemptResult> {
   let transporter: Transporter;
   try {
-    transporter = createSmtpTransport(config, password);
-  } catch (error) {
+    transporter = await createSmtpTransport(config, password, lookup);
+  } catch {
     return {
       connectionEstablished: false,
       authenticated: false,
@@ -162,7 +158,7 @@ export async function submitSmtp(
       smtpResponseCategory: null,
       outcome: 'failed',
       deliveryUncertain: false,
-      reasons: [error instanceof Error ? error.message : 'Could not create the SMTP transport.'],
+      reasons: ['Could not create a safe SMTP transport.'],
     };
   }
 

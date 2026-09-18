@@ -1496,7 +1496,7 @@ claude mcp get proton-mail-mcp
 Cloning alone is **not sufficient**. Config, Bridge credentials, TLS certificate and signing secrets
 are intentionally excluded from Git. On a fresh Mac:
 
-1. Clone this private repository and enter it.
+1. Clone this repository and enter it.
 2. Install Node >=24 and pnpm 12, then run `./scripts/bootstrap.sh`. Use `--check` for a read-only
    inventory.
 3. Install and sign in to Proton Mail Bridge. Open Bridge's **Mailbox details** for the
@@ -1521,3 +1521,7 @@ It never sends an email, opens an SMTP session, changes mailbox state, or delete
 Linux and Windows are future work, not supported in 0.6.0. An issue for that work should cover Linux
 Secret Service/KWallet, Windows Credential Manager, platform-specific bootstrap, and Bridge
 installation differences. No cross-platform implementation is included in this release.
+
+## License
+
+Licensed under Apache-2.0. See [LICENSE](LICENSE). Copyright 2026 RaioViajante.

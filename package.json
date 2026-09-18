@@ -4,7 +4,7 @@
   "private": true,
   "description": "macOS-only local Proton Mail Bridge MCP server with read-only intelligence, controlled mailbox actions, consent-gated plain-text send/reply/forward, durable cross-process replay protection, bootstrap, and read-only diagnostics.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=24"
   },

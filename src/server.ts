@@ -26,6 +26,7 @@ import { registerTriageIntelligenceTools } from './tools/triage-intelligence.js'
 import { registerUnsubscribePreviewTool } from './tools/unsubscribe-preview.js';
 import { registerUnsubscribeTool } from './tools/unsubscribe.js';
 import { registerSystemStatusTool } from './tools/system-status.js';
+import { installMcpToolErrorBoundary } from './security/mcp-tool-error.js';
 import { SERVER_NAME, SERVER_VERSION } from './version.js';
 
 /**
@@ -170,6 +171,8 @@ export function createServer(): McpServer {
     { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: { tools: {} } },
   );
+
+  installMcpToolErrorBoundary(server);
 
   registerListFoldersTool(server);
   registerListMessagesTool(server);

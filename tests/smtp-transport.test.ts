@@ -173,6 +173,30 @@ describe('submitSmtp — controlled fakes, never a real socket', () => {
     expect(result.deliveryUncertain).toBe(true);
   });
 
+  it('returned SMTP failures contain no library-controlled error fields', async () => {
+    const sendFn = vi.fn().mockRejectedValue({
+      code: 'SENSITIVE_ERROR_CODE',
+      command: 'SENSITIVE_SMTP_COMMAND',
+      response: 'SENSITIVE_SMTP_RESPONSE',
+      responseCode: 450,
+      message:
+        'SENSITIVE_EMAIL@example.invalid <secret-message-id@example.invalid> /Users/test/private/config.json',
+      cause: new Error('FAKE_SECRET_TOKEN_123 SENSITIVE_TLS_TEXT'),
+      stack: 'SENSITIVE_STACK',
+    });
+    const result = await submitSmtp(config, 'pw', message, sendFn);
+    const serialized = JSON.stringify(result);
+    expect(result.outcome).toBe('uncertain');
+    expect(result.deliveryUncertain).toBe(true);
+    expect(result.reasons).toEqual([
+      'The SMTP server reported a temporary failure; delivery state is uncertain and this was not retried automatically.',
+    ]);
+    expect(serialized).not.toMatch(
+      /SENSITIVE_|example\.invalid|\/Users\/test|FAKE_SECRET_TOKEN|secret-message-id/,
+    );
+    expect(sendFn).toHaveBeenCalledTimes(1);
+  });
+
   it('recipient rejection (definitive 5xx): outcome rejected', async () => {
     const sendFn = vi
       .fn()

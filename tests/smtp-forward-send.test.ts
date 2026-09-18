@@ -470,6 +470,29 @@ describe('sendForward (0.5.4)', () => {
     expect(sendFn).toHaveBeenCalledTimes(1);
   });
 
+  it('does not expose hostile SMTP error fields in the returned forward result', async () => {
+    const sendFn = vi.fn().mockRejectedValue({
+      code: 'SENSITIVE_ERROR_CODE',
+      command: 'SENSITIVE_SMTP_COMMAND',
+      response: 'SENSITIVE_SMTP_RESPONSE',
+      responseCode: 450,
+      message: 'SENSITIVE_EMAIL@example.invalid /Users/test/private/config.json',
+      cause: new Error('FAKE_SECRET_TOKEN_123'),
+      stack: 'SENSITIVE_STACK',
+    });
+    const result = await sendForward(
+      source(),
+      { ...basePayload, forwardIntentReceipt: previewReceipt(), ...liveParams },
+      smtpConfig,
+      SECRET,
+      { getPassword, sendFn },
+    );
+    expect(result.outcome).toBe('uncertain');
+    expect(result.deliveryUncertain).toBe(true);
+    expect(JSON.stringify(result)).not.toMatch(/SENSITIVE_|example\.invalid|\/Users\/test/);
+    expect(sendFn).toHaveBeenCalledTimes(1);
+  });
+
   describe('0.5.4 default gate', () => {
     it('with no override, a fully valid live forward reaches SMTP exactly once', async () => {
       const receipt = previewReceipt();

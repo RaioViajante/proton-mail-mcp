@@ -433,5 +433,28 @@ describe('sendReply (0.5.3)', () => {
       expect(second.outcome).toBe('rejected');
       expect(sendFn).toHaveBeenCalledTimes(1);
     });
+
+    it('does not expose hostile SMTP error fields in the returned reply result', async () => {
+      const sendFn = vi.fn().mockRejectedValue({
+        code: 'SENSITIVE_ERROR_CODE',
+        command: 'SENSITIVE_SMTP_COMMAND',
+        response: 'SENSITIVE_SMTP_RESPONSE',
+        responseCode: 450,
+        message: 'SENSITIVE_EMAIL@example.invalid /Users/test/private/config.json',
+        cause: new Error('FAKE_SECRET_TOKEN_123'),
+        stack: 'SENSITIVE_STACK',
+      });
+      const result = await sendReply(
+        source(),
+        { ...basePayload, replyIntentReceipt: previewReceipt(), ...liveParams },
+        smtpConfig,
+        SECRET,
+        { getPassword, sendFn, liveDisabled: false },
+      );
+      expect(result.outcome).toBe('uncertain');
+      expect(result.deliveryUncertain).toBe(true);
+      expect(JSON.stringify(result)).not.toMatch(/SENSITIVE_|example\.invalid|\/Users\/test/);
+      expect(sendFn).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -48,8 +48,10 @@ export interface SmtpLikeError {
 }
 
 function categoryOf(responseCode: number | undefined, response: string | undefined): string | null {
-  if (typeof responseCode === 'number') {
-    return `${Math.floor(responseCode / 100)}xx`;
+  if (typeof responseCode === 'number' && Number.isFinite(responseCode)) {
+    const hundreds = Math.floor(responseCode / 100);
+    if (hundreds < 1 || hundreds > 5) return null;
+    return `${hundreds}xx`;
   }
   const match = response ? /^(\d)\d\d/.exec(response.trim()) : null;
   return match ? `${match[1]}xx` : null;
@@ -118,13 +120,18 @@ export function classifySmtpSuccess(info: SmtpSuccessInfo): SmtpAttemptResult {
  * `nodemailer`/`smtp-connection`'s public API documents that an error
  * message can never end up echoing part of an AUTH exchange, so this never
  * relies on that being true. Every reason here is a fixed, stable sentence
- * built from `code`/`command`/`responseCode` only — safe to log, safe to
- * return, and exactly as informative to a caller either way.
+ * built from fixed categories. Low-level fields are used only as internal
+ * lookup keys and are never copied into a result.
  */
 export function classifySmtpError(error: SmtpLikeError): SmtpAttemptResult {
   // A definitive server response code always wins, regardless of phase: the
   // server told us something concrete, so this is never "uncertain".
-  if (typeof error.responseCode === 'number') {
+  if (
+    typeof error.responseCode === 'number' &&
+    Number.isFinite(error.responseCode) &&
+    error.responseCode >= 100 &&
+    error.responseCode <= 599
+  ) {
     const category = categoryOf(error.responseCode, undefined);
     const permanent = error.responseCode >= 500;
     return {
@@ -141,11 +148,14 @@ export function classifySmtpError(error: SmtpLikeError): SmtpAttemptResult {
       // connection-loss ambiguity.
       outcome: permanent ? 'rejected' : 'uncertain',
       deliveryUncertain: !permanent,
-      reasons: [
-        `The SMTP server returned a ${category} response` +
-          (error.command ? ` to ${error.command}` : '') +
-          '.',
-      ],
+      reasons:
+        error.command === 'AUTH'
+          ? ['SMTP authentication failed.']
+          : permanent
+            ? ['The SMTP server rejected the submission.']
+            : [
+                'The SMTP server reported a temporary failure; delivery state is uncertain and this was not retried automatically.',
+              ],
     };
   }
 
@@ -163,7 +173,10 @@ export function classifySmtpError(error: SmtpLikeError): SmtpAttemptResult {
       smtpResponseCategory: null,
       outcome: 'failed',
       deliveryUncertain: false,
-      reasons: [`Could not establish an SMTP connection${error.code ? ` (${error.code})` : ''}.`],
+      reasons:
+        error.code === 'ETIMEDOUT'
+          ? ['Could not establish an SMTP connection because it timed out.']
+          : ['Could not establish an SMTP connection.'],
     };
   }
   if (error.command === 'AUTH') {
@@ -194,8 +207,7 @@ export function classifySmtpError(error: SmtpLikeError): SmtpAttemptResult {
     outcome: 'uncertain',
     deliveryUncertain: true,
     reasons: [
-      `The connection was lost or timed out during ${error.command}${error.code ? ` (${error.code})` : ''}; ` +
-        'delivery state is unknown and this was not retried automatically.',
+      'The connection was lost or timed out during submission; delivery state is unknown and this was not retried automatically.',
     ],
   };
 }

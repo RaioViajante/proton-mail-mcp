@@ -66,6 +66,17 @@ describe('classifySmtpError — connection phase', () => {
     expect(result.outcome).toBe('failed');
     expect(result.connectionEstablished).toBe(false);
   });
+
+  it('uses a fixed timeout reason without exposing the library code', () => {
+    const result = classifySmtpError({
+      code: 'ETIMEDOUT',
+      message: 'SENSITIVE_TLS_TEXT /Users/test/private/config.json',
+    });
+    expect(result.reasons).toEqual([
+      'Could not establish an SMTP connection because it timed out.',
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/SENSITIVE_|\/Users\/test|config\.json/);
+  });
 });
 
 describe('classifySmtpError — auth phase', () => {
@@ -148,6 +159,37 @@ describe('classifySmtpError — disconnect during/after submission (ambiguous, n
   it('reasons explain that this was not retried automatically', () => {
     const result = classifySmtpError({ command: 'DATA', message: 'connection lost' });
     expect(result.reasons.join(' ')).toMatch(/not retried automatically/i);
+  });
+
+  it('never returns hostile code, command, message, cause, or stack values', () => {
+    const result = classifySmtpError({
+      code: 'SENSITIVE_ERROR_CODE',
+      command: 'SENSITIVE_SMTP_COMMAND',
+      responseCode: 450,
+      message:
+        'SENSITIVE_SMTP_RESPONSE SENSITIVE_EMAIL@example.invalid <secret-message-id@example.invalid> ' +
+        '/Users/test/private/config.json FAKE_SECRET_TOKEN_123 SENSITIVE_TLS_TEXT',
+    });
+    expect(result.outcome).toBe('uncertain');
+    expect(result.reasons).toEqual([
+      'The SMTP server reported a temporary failure; delivery state is uncertain and this was not retried automatically.',
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(
+      /SENSITIVE_|example\.invalid|\/Users\/test|FAKE_SECRET_TOKEN|secret-message-id/,
+    );
+  });
+});
+
+describe('classifySmtpError — unknown values fail safely', () => {
+  it('uses fixed output for unknown command, code, response, and malformed values', () => {
+    const result = classifySmtpError({
+      code: 'SENSITIVE_UNKNOWN_CODE',
+      command: 'SENSITIVE_UNKNOWN_COMMAND',
+      responseCode: Number.NaN,
+      message: 'SENSITIVE_MESSAGE',
+    });
+    expect(result.outcome).toBe('uncertain');
+    expect(JSON.stringify(result)).not.toContain('SENSITIVE_');
   });
 });
 

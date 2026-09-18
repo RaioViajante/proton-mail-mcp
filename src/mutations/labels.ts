@@ -1,5 +1,6 @@
 import type { CopyResponseObject, ImapFlow } from 'imapflow';
 import { assertBatchSize, dedupeUids } from './batch.js';
+import { mutationFailureMessage } from './error.js';
 import { fetchExistingUids } from './existence.js';
 import { assertFolderExists } from './policy.js';
 import { createMutationResult, type MutationResult } from './result.js';
@@ -171,11 +172,11 @@ export async function applyLabel(
         result.errors.push({ uid, message: 'IMAP server rejected applying the label.' });
       }
     }
-  } catch (error) {
+  } catch {
     for (const message of stillUnlabeled) {
       result.errors.push({
         uid: message.uid,
-        message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+        message: mutationFailureMessage('mailboxOperationFailed'),
       });
     }
   } finally {
@@ -293,11 +294,11 @@ export async function removeLabel(
         });
       }
     }
-  } catch (error) {
+  } catch {
     for (const target of targets) {
       result.errors.push({
         uid: target.sourceUid,
-        message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+        message: mutationFailureMessage('mailboxOperationFailed'),
       });
     }
   } finally {

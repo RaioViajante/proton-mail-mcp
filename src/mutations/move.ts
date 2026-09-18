@@ -1,6 +1,7 @@
 import type { CopyResponseObject, ImapFlow, ListResponse } from 'imapflow';
 import { assertBatchSize, dedupeUids } from './batch.js';
 import { fetchExistingMessages, fetchExistingUids } from './existence.js';
+import { mutationFailureMessage } from './error.js';
 import {
   assertFolderExists,
   assertMoveDestinationAllowed,
@@ -90,11 +91,11 @@ export async function moveMessagesCore(
         result.errors.push({ uid, message: 'IMAP server rejected the move.' });
       }
     }
-  } catch (error) {
+  } catch {
     for (const uid of result.matchedUids) {
       result.errors.push({
         uid,
-        message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+        message: mutationFailureMessage('mailboxOperationFailed'),
       });
     }
   } finally {

@@ -1,4 +1,5 @@
 import type { ImapFlow } from 'imapflow';
+import { mutationFailureMessage } from './error.js';
 import { validateCustomMailboxName } from './folders.js';
 import { findNameConflict, LABELS_CONTAINER } from './policy.js';
 
@@ -50,7 +51,12 @@ export async function createLabel(
     return { operation: 'mail_create_label', dryRun, path, alreadyExists: false, created: false };
   }
 
-  const response = await client.mailboxCreate([LABELS_CONTAINER, name]);
+  let response: Awaited<ReturnType<ImapFlow['mailboxCreate']>>;
+  try {
+    response = await client.mailboxCreate([LABELS_CONTAINER, name]);
+  } catch {
+    throw new Error(mutationFailureMessage('mailboxOperationFailed'));
+  }
   return {
     operation: 'mail_create_label',
     dryRun,

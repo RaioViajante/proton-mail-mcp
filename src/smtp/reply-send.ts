@@ -265,14 +265,11 @@ export async function sendReply(
   let password: string;
   try {
     password = await deps.getPassword();
-  } catch (error) {
+  } catch {
     return {
       ...base,
       intentValidated: true,
-      reasons: [
-        ...validation.reasons,
-        error instanceof Error ? error.message : 'Could not retrieve the Bridge SMTP credential.',
-      ],
+      reasons: [...validation.reasons, 'Could not retrieve the Bridge SMTP credential.'],
       connectionEstablished: false,
       authenticated: false,
       submissionAttempted: false,

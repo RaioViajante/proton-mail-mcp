@@ -1,5 +1,6 @@
 import type { ImapFlow } from 'imapflow';
 import { assertBatchSize, dedupeUids } from './batch.js';
+import { mutationFailureMessage } from './error.js';
 import { fetchExistingUids } from './existence.js';
 import { assertFolderExists } from './policy.js';
 import { createMutationResult, type MutationResult } from './result.js';
@@ -107,11 +108,11 @@ async function setReadState(
         result.errors.push({ uid, message: 'IMAP server rejected the flag change.' });
       }
     }
-  } catch (error) {
+  } catch {
     for (const uid of toChange) {
       result.errors.push({
         uid,
-        message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+        message: mutationFailureMessage('mailboxOperationFailed'),
       });
     }
   } finally {

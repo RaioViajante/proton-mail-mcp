@@ -1,4 +1,5 @@
 import type { ImapFlow } from 'imapflow';
+import { mutationFailureMessage } from './error.js';
 import {
   assertCreateFolderParentAllowed,
   customFolderPathFromSegments,
@@ -166,7 +167,12 @@ export async function createFolder(
     return { operation: 'mail_create_folder', dryRun, path, alreadyExists: false, created: false };
   }
 
-  const response = await client.mailboxCreate(path.split(delimiter));
+  let response: Awaited<ReturnType<ImapFlow['mailboxCreate']>>;
+  try {
+    response = await client.mailboxCreate(path.split(delimiter));
+  } catch {
+    throw new Error(mutationFailureMessage('mailboxOperationFailed'));
+  }
   return {
     operation: 'mail_create_folder',
     dryRun,

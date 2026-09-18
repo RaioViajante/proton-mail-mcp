@@ -305,7 +305,7 @@ describe('mail_send (0.5.1 — live path)', () => {
       const failingGetPassword = vi
         .fn<() => Promise<string>>()
         .mockRejectedValue(
-          new Error('Could not read the Bridge password from the macOS Keychain.'),
+          new Error('fake@example.test <fake-id@example.test> /tmp/private-fixture'),
         );
       const sendFn = vi.fn();
       const result = await sendMail(
@@ -318,10 +318,8 @@ describe('mail_send (0.5.1 — live path)', () => {
       expect(result.connectionEstablished).toBe(false);
       expect(result.submissionAttempted).toBe(false);
       expect(sendFn).not.toHaveBeenCalled();
-      // Sanitized: the underlying Keychain error message never contains the
-      // secret itself (getBridgePassword's own contract) — assert it isn't
-      // even attempted to be embedded raw beyond that generic message.
-      expect(result.reasons.join(' ')).not.toMatch(/bridge-password/);
+      expect(result.reasons).toContain('Could not retrieve the Bridge SMTP credential.');
+      expect(JSON.stringify(result)).not.toContain('fake@example.test');
     });
 
     it('TLS certificate missing: fails closed, zero send attempt', async () => {

@@ -692,7 +692,7 @@ describe('mail_trash (trashMessages) — reconnect / uncertain move (0.4.1)', ()
       },
     });
     fake.messageMove.mockImplementationOnce(() => {
-      throw new Error('socket hang up');
+      throw new Error('A12 NO fake@example.test <fake-id@example.test> /tmp/private-fixture');
     });
 
     const result = await trashMessages(asImapFlow(fake), {
@@ -721,7 +721,7 @@ describe('mail_trash (trashMessages) — reconnect / uncertain move (0.4.1)', ()
       },
     });
     fake.messageMove.mockImplementationOnce(() => {
-      throw new Error('socket hang up');
+      throw new Error('A12 NO fake@example.test <fake-id@example.test> /tmp/private-fixture');
     });
 
     const result = await trashMessages(asImapFlow(fake), {
@@ -733,7 +733,8 @@ describe('mail_trash (trashMessages) — reconnect / uncertain move (0.4.1)', ()
     });
 
     expect(result.changedUids).toEqual([]);
-    expect(result.errors).toEqual([{ uid: 10, message: 'socket hang up' }]);
+    expect(result.errors).toEqual([{ uid: 10, message: 'Mailbox operation failed.' }]);
+    expect(JSON.stringify(result)).not.toContain('fake@example.test');
     expect(fake.messageMove).toHaveBeenCalledTimes(1);
   });
 

@@ -4,6 +4,7 @@ import {
   validateRestoreReceipt,
 } from '../security/restore-receipt.js';
 import { assertBatchSize, dedupeUids } from './batch.js';
+import { mutationFailureMessage } from './error.js';
 import { fetchExistingUids } from './existence.js';
 import {
   fetchPreservableFlags,
@@ -291,8 +292,8 @@ async function repairFlag(
         failed.push({ uid: requestedUid, flag, reason: 'IMAP server rejected the flag change.' });
       }
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown IMAP error.';
+  } catch {
+    const message = mutationFailureMessage('flagRepairFailed');
     for (const target of targets) {
       failed.push({ uid: target.requestedUid, flag, reason: message });
     }
@@ -619,7 +620,7 @@ export async function restoreFromTrash(
       moveResponse = await client.messageMove(result.matchedUids, resolvedDestinationFolder, {
         uid: true,
       });
-    } catch (error) {
+    } catch {
       // The command may have reached the server before the connection or
       // response was lost — never assume a clean failure (see
       // mutations/uncertain-move.ts).
@@ -635,7 +636,7 @@ export async function restoreFromTrash(
       for (const uid of classification.notMoved) {
         result.errors.push({
           uid,
-          message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+          message: mutationFailureMessage('mailboxOperationFailed'),
         });
       }
       for (const uid of classification.uncertain) {
@@ -875,8 +876,8 @@ export async function restoreFromTrash(
               });
             }
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Unknown error applying label.';
+        } catch {
+          const message = mutationFailureMessage('labelRepairFailed');
           for (const requestedUid of requestedUids) {
             labelsFailed.push({ uid: requestedUid, label, reason: message });
           }
@@ -927,18 +928,15 @@ export async function restoreFromTrash(
         !flagsFailedUids.has(uid);
       result.statePreserved.push({ uid, preserved });
     }
-  } catch (error) {
+  } catch {
     // A reconnect/failure anywhere in verification or repair must never
     // swallow a folder move that already succeeded — report the
     // uncertainty and return what was accomplished, never re-throw past
     // this point and never retry the move.
     result.requiresRefresh = true;
-    const message =
-      error instanceof Error
-        ? error.message
-        : 'Unknown error during post-move verification/repair.';
+    const message = mutationFailureMessage('postMoveRepairFailed');
     for (const uid of result.changedUids) {
-      result.errors.push({ uid, message: `Post-move verification/repair incomplete: ${message}` });
+      result.errors.push({ uid, message });
     }
     for (const uid of result.matchedUids) {
       if (!result.statePreserved.some((entry) => entry.uid === uid)) {

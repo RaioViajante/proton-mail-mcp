@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { ImapFlow } from 'imapflow';
+import { publicOperationError } from '../security/public-operation-error.js';
 import { type BridgeConfig, getBridgePassword, loadBridgeConfig } from './config.js';
 
 function readTlsCertificate(tlsCertPath: string): string {
@@ -73,6 +74,8 @@ export async function withBridgeConnection<T>(fn: (client: ImapFlow) => Promise<
   const client = await connectToBridge(config);
   try {
     return await fn(client);
+  } catch (error) {
+    throw publicOperationError(error);
   } finally {
     await client.logout().catch(() => {
       client.close();

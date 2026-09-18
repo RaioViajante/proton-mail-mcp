@@ -6,6 +6,7 @@ import {
   type RestoreReceiptEnvelope,
 } from '../security/restore-receipt.js';
 import { assertBatchSize, dedupeUids } from './batch.js';
+import { mutationFailureMessage } from './error.js';
 import { fetchExistingUids } from './existence.js';
 import {
   fetchPreservableFlags,
@@ -249,7 +250,7 @@ export async function trashMessages(
 
     try {
       moveResponse = await client.messageMove(result.matchedUids, special.trash, { uid: true });
-    } catch (error) {
+    } catch {
       // The command may have reached the server before the connection or
       // response was lost — never assume a clean failure here (see
       // mutations/uncertain-move.ts).
@@ -265,7 +266,7 @@ export async function trashMessages(
       for (const uid of classification.notMoved) {
         result.errors.push({
           uid,
-          message: error instanceof Error ? error.message : 'Unknown IMAP error.',
+          message: mutationFailureMessage('mailboxOperationFailed'),
         });
       }
       for (const uid of classification.uncertain) {

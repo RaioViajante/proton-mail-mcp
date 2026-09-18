@@ -55,12 +55,12 @@ async function defaultSendOneClick(target: { url: URL }) {
       outcome: posted.outcome as OneClickOutcome | null,
       reason: posted.failureReason,
     };
-  } catch (error) {
+  } catch {
     return {
       requestSent: false,
       httpStatus: null,
       outcome: null as OneClickOutcome | null,
-      reason: error instanceof Error ? error.message : 'DNS resolution failed.',
+      reason: 'Unsubscribe target validation failed.',
     };
   }
 }

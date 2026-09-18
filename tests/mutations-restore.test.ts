@@ -798,7 +798,7 @@ describe('mail_restore_from_trash (restoreFromTrash) — failure paths', () => {
       },
     });
     fake.messageMove.mockImplementationOnce(() => {
-      throw new Error('socket hang up');
+      throw new Error('A12 NO fake@example.test <fake-id@example.test> /tmp/private-fixture');
     });
 
     const result = await restoreFromTrash(asImapFlow(fake), {
@@ -822,7 +822,7 @@ describe('mail_restore_from_trash (restoreFromTrash) — failure paths', () => {
       },
     });
     fake.messageMove.mockImplementationOnce(() => {
-      throw new Error('socket hang up');
+      throw new Error('A12 NO fake@example.test <fake-id@example.test> /tmp/private-fixture');
     });
 
     const result = await restoreFromTrash(asImapFlow(fake), {
@@ -832,7 +832,8 @@ describe('mail_restore_from_trash (restoreFromTrash) — failure paths', () => {
     });
 
     expect(result.changedUids).toEqual([]);
-    expect(result.errors).toEqual([{ uid: 5, message: 'socket hang up' }]);
+    expect(result.errors).toEqual([{ uid: 5, message: 'Mailbox operation failed.' }]);
+    expect(JSON.stringify(result)).not.toContain('fake@example.test');
     expect(fake.messageMove).toHaveBeenCalledTimes(1);
   });
 
@@ -922,7 +923,9 @@ describe('mail_restore_from_trash (restoreFromTrash) — failure paths', () => {
     });
 
     expect(result.moveRestored).toEqual([5]);
-    expect(result.labelsFailed).toEqual([{ uid: 5, label: 'Work', reason: 'connection reset' }]);
+    expect(result.labelsFailed).toEqual([
+      { uid: 5, label: 'Work', reason: 'Mailbox operation failed.' },
+    ]);
     expect(result.partialSuccess).toBe(true);
   });
 
@@ -948,7 +951,7 @@ describe('mail_restore_from_trash (restoreFromTrash) — failure paths', () => {
     });
 
     expect(result.moveRestored).toEqual([5]);
-    expect(result.flagsFailed).toEqual([{ uid: 5, flag: '\\Seen', reason: 'connection reset' }]);
+    expect(result.flagsFailed).toEqual([{ uid: 5, flag: '\\Seen', reason: 'Flag repair failed.' }]);
     expect(result.partialSuccess).toBe(true);
   });
 
